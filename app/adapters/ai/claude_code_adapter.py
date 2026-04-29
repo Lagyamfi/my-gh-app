@@ -7,10 +7,10 @@ AI_PROVIDER environment variable (see app.main).
 import asyncio
 import json
 import logging
+import re
+import shutil
 import time
 from collections.abc import AsyncGenerator
-
-import anthropic
 
 from app.adapters._subprocess import clean_env
 from app.domain.exceptions import ProviderError
@@ -48,6 +48,41 @@ Read the relevant files, understand the issue, and EDIT the files to implement t
 Make minimal, targeted changes. Do NOT create new files unless absolutely necessary.
 Do NOT run tests or build commands — just make the code changes."""
 
+# Bytes regex matching versioned Claude model IDs embedded in the claude binary
+# (e.g. b"claude-sonnet-4-6", b"claude-opus-4-7", b"claude-haiku-4-5-20251001")
+_BINARY_MODEL_RE = re.compile(rb"claude-(?:opus|sonnet|haiku)-\d+(?:-\d+)+")
+
+
+def list_models() -> list[str]:
+    """Return model IDs known to the installed claude binary.
+
+    Scans the binary for embedded model name patterns — 100% local, no
+    network call required. Falls back to the three canonical aliases if the
+    binary cannot be read or is not on PATH.
+    """
+    aliases = ["opus", "sonnet", "haiku"]
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        return aliases
+    try:
+        with open(claude_path, "rb") as fh:
+            data = fh.read()
+        raw = {m.decode() for m in _BINARY_MODEL_RE.findall(data)}
+        # Keep only clean IDs (all chars are alphanumeric or hyphen)
+        clean = {m for m in raw if re.fullmatch(r"[a-z0-9-]+", m)}
+
+        def _sort_key(name: str) -> tuple[int, str]:
+            for i, family in enumerate(("opus", "sonnet", "haiku")):
+                if family in name:
+                    return (i, name)
+            return (3, name)
+
+        versioned = sorted(clean, key=_sort_key)
+        logger.info("claude-code | list_models | found=%d from binary", len(versioned))
+    except OSError:
+        versioned = []
+    return aliases + [m for m in versioned if m not in set(aliases)]
+
 
 def _parse_review_output(output: str) -> Review:
     """Parse raw AI output into a Review. Returns a fallback Review on parse failure."""
@@ -82,42 +117,6 @@ def _parse_review_output(output: str) -> Review:
     )
 
 
-def _is_bedrock_inference_profile(model_id: str) -> bool:
-    """Return True for AWS Bedrock model/inference-profile IDs (contain ':')."""
-    return ":" in model_id
-
-
-async def _stream_bedrock_sdk(
-    model: str,
-    prompt: str,
-    timeout: int = 300,
-) -> AsyncGenerator[str, None]:
-    """Stream directly via the Anthropic SDK's Bedrock backend.
-
-    Bypasses the Claude Code CLI entirely, so Claude Code's built-in model
-    registry validation never runs. AWS credentials are taken from the
-    standard environment variables (AWS_REGION, AWS_ACCESS_KEY_ID, etc.)
-    or from ~/.aws/credentials, exactly as the boto3/bedrock SDK expects.
-    """
-    t_start = time.monotonic()
-    logger.info("claude-code | bedrock-sdk | model=%s", model)
-    try:
-        client = anthropic.AsyncAnthropicBedrock()
-        async with client.messages.stream(
-            model=model,
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            async for chunk in stream.text_stream:
-                yield chunk
-    except anthropic.APIError as exc:
-        elapsed = time.monotonic() - t_start
-        logger.error("claude-code | bedrock-sdk | error=%.80s elapsed=%.1fs", exc, elapsed)
-        raise ProviderError(f"Bedrock API error: {exc}") from exc
-    elapsed = time.monotonic() - t_start
-    logger.info("claude-code | bedrock-sdk | done elapsed=%.1fs", elapsed)
-
-
 async def _stream_claude_code(
     message: str,
     context: str | None = None,
@@ -129,27 +128,13 @@ async def _stream_claude_code(
     """Stream raw claude (Claude Code) output line by line.
 
     Uses `claude -p` (print/non-interactive mode) which prints to stdout and exits.
-    For Bedrock inference profile IDs (containing ':') in read-only flows,
-    delegates to _stream_bedrock_sdk to bypass Claude Code's model validation.
+    Always passes the prompt as a positional argument — claude's `-p` mode does not
+    reliably consume stdin in some installs. Linux ARG_MAX is ~2 MB so even large
+    review prompts fit comfortably.
     """
     prompt = message
     if context:
         prompt = f"{message}\n\n---\n\n{context}"
-
-    # Bedrock inference profile IDs (e.g. eu.anthropic.claude-sonnet-4-20250514-v1:0)
-    # contain ':' as a version separator. Claude Code CLI's --bare mode validates
-    # --model against its static registry which doesn't include these profiles,
-    # so they fail with "may not exist" even when available on Bedrock. For
-    # read-only flows, bypass the CLI entirely and call Bedrock via the SDK.
-    if model and not allow_edits:
-        cli_model = model.split("/", 1)[1] if "/" in model else model
-        if _is_bedrock_inference_profile(cli_model):
-            logger.info(
-                "claude-code | bedrock-profile | routing to sdk | model=%s", cli_model
-            )
-            async for chunk in _stream_bedrock_sdk(cli_model, prompt, timeout):
-                yield chunk
-            return
 
     prompt_kb = len(prompt.encode()) / 1024
     logger.info(
@@ -158,38 +143,28 @@ async def _stream_claude_code(
     )
     t_start = time.monotonic()
 
-    subprocess_env = clean_env()
     extra_args: list[str] = ["-p", "--output-format", "text"]
     if model:
+        # Strip optional provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
         cli_model = model.split("/", 1)[1] if "/" in model else model
-        subprocess_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = cli_model
         extra_args += ["--model", cli_model]
     if allow_edits:
         # Fix flow: keep CLAUDE.md auto-discovery, hooks, plugins so claude
         # has project context while editing, and bypass per-tool prompts.
         extra_args += ["--dangerously-skip-permissions"]
     else:
-        # Read-only flows (review, analyze comments, generate-text): use
-        # --bare so keychain reads, hooks, LSP, and CLAUDE.md auto-discovery
-        # are skipped. Without --bare, headless subprocess invocations fail
-        # the keychain-read step (the keychain agent gates non-interactive
-        # access) and Claude Code falls back to a stricter model-validation
-        # path that rejects Bedrock inference profiles with a misleading
-        # "may not exist or you may not have access" error. --bare keeps
-        # 3P (Bedrock/Vertex/Foundry) credentials intact, which is what
-        # the read-only flows need.
+        # Read-only flows (review, analyze comments, generate-text): use --bare
+        # so keychain reads, hooks, LSP, and CLAUDE.md auto-discovery are skipped.
+        # Without --bare, headless subprocess invocations fail the keychain-read
+        # step and fall back to a strict model-validation path.
         extra_args += ["--bare"]
 
-    # Always pass the prompt as a positional argument. The `claude` CLI's
-    # `-p` (print) mode does not reliably consume stdin in some installs —
-    # it exits ~1.5s with a short error message printed to stdout. Linux
-    # ARG_MAX is ~2 MB so a 30 KB review prompt fits comfortably.
     proc = await asyncio.create_subprocess_exec(
         "claude", *extra_args, prompt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env=subprocess_env,
+        env=clean_env(),
     )
 
     if proc.stdout is None or proc.stderr is None:
@@ -246,13 +221,8 @@ async def _stream_claude_code(
             warning_lines.insert(0, f"[claude exited with code {rc} and produced no output]")
         else:
             warning_lines.insert(0, f"[claude exited with code {rc}]")
-            # Promote stdout into the warning channel — when claude fails fast
-            # (e.g. authentication error) it usually prints the reason to
-            # stdout, not stderr. Surfacing it here makes the error visible in
-            # the UI's warning panel instead of being buried in raw_output.
             if captured_stdout:
                 warning_lines.append("[claude stdout]")
-                # Cap at ~40 lines / 4 KB so a runaway log doesn't flood the UI.
                 snippet = captured_stdout[:4000]
                 for cap_line in snippet.splitlines()[:40]:
                     warning_lines.append(cap_line)
@@ -264,7 +234,6 @@ async def _stream_claude_code(
     # response. Raise so the SSE pipeline emits an `error` event and the UI
     # shows it prominently instead of presenting a hollow "0 findings" review.
     if rc != 0:
-        # Build a one-line summary the user will actually read in the UI.
         first_stdout_line = next(
             (line for line in captured_stdout.splitlines() if line.strip()), ""
         )
@@ -272,7 +241,6 @@ async def _stream_claude_code(
             (line for line in stderr_lines if line.strip()), ""
         )
         detail = first_stdout_line or first_stderr_line or "(no output)"
-        # Keep the detail short — full text is in warnings + raw_output.
         if len(detail) > 200:
             detail = detail[:197] + "..."
         logger.error(

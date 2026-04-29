@@ -8,6 +8,7 @@ from app.adapters.ai.claude_code_adapter import (
     ClaudeCodeAdapter,
     _parse_review_output,
     _stream_claude_code,
+    list_models,
 )
 from app.domain.exceptions import ProviderError
 from app.ports.ai_provider import (
@@ -51,6 +52,48 @@ class TestParseReviewOutput:
         review = _parse_review_output(raw)
         assert review.summary == "ok"
         assert review.findings == []
+
+
+class TestListModels:
+    def test_returns_aliases_when_claude_not_on_path(self, monkeypatch):
+        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: None)
+        result = list_models()
+        assert result == ["opus", "sonnet", "haiku"]
+
+    def test_returns_aliases_on_binary_read_error(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: str(tmp_path / "no-such-file"))
+        result = list_models()
+        assert result == ["opus", "sonnet", "haiku"]
+
+    def test_extracts_versioned_ids_from_binary(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "claude"
+        # Embed known model IDs alongside garbage bytes
+        fake_bin.write_bytes(
+            b"\x00some-garbage\x00"
+            b"claude-sonnet-4-6\x00"
+            b"claude-opus-4-7\x00"
+            b"claude-haiku-4-5-20251001\x00"
+            b"not-a-model\x00"
+            b"claude-opus-4(?!-regex)\x00"  # regex artifact — must be filtered out
+        )
+        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: str(fake_bin))
+        result = list_models()
+        assert "opus" in result
+        assert "sonnet" in result
+        assert "haiku" in result
+        assert "claude-sonnet-4-6" in result
+        assert "claude-opus-4-7" in result
+        assert "claude-haiku-4-5-20251001" in result
+        # Regex artifact must be excluded
+        assert not any("?" in m or "!" in m for m in result)
+
+    def test_aliases_come_before_versioned_ids(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "claude"
+        fake_bin.write_bytes(b"claude-sonnet-4-6\x00claude-opus-4-7\x00")
+        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: str(fake_bin))
+        result = list_models()
+        assert result.index("opus") < result.index("claude-opus-4-7")
+        assert result.index("sonnet") < result.index("claude-sonnet-4-6")
 
 
 def _async_iter_strings(items):
@@ -183,18 +226,11 @@ async def test_stream_claude_code_strips_provider_prefix_from_model(monkeypatch)
     proc = _FakeProc([b'{"summary":"ok","findings":[]}\n'], [], 0)
     _patch_subprocess(monkeypatch, proc, captured)
 
-    chunks = []
-    async for chunk in _stream_claude_code(
+    async for _ in _stream_claude_code(
         "short prompt", model="anthropic/claude-sonnet-4-6"
     ):
-        chunks.append(chunk)
+        pass
 
-    # Model is registered via ANTHROPIC_CUSTOM_MODEL_OPTION so Claude Code's
-    # static registry (used in --bare mode) accepts Bedrock inference profile
-    # IDs that aren't in the built-in list. The --model flag is still passed
-    # so Claude Code selects the right model for the session.
-    env = captured["kwargs"]["env"]
-    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "claude-sonnet-4-6"
     args = captured["args"]
     assert "--model" in args
     assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
@@ -209,16 +245,14 @@ async def test_stream_claude_code_passes_unprefixed_model_through(monkeypatch):
     async for _ in _stream_claude_code("short prompt", model="claude-opus-4-7"):
         pass
 
-    env = captured["kwargs"]["env"]
-    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "claude-opus-4-7"
     args = captured["args"]
     assert args[args.index("--model") + 1] == "claude-opus-4-7"
 
 
 async def test_stream_claude_code_uses_bare_for_read_only_flows(monkeypatch):
     """Review / analyze / generate-text invocations must include --bare so
-    Claude Code skips the keychain-read step that breaks headless subprocess
-    invocation against Bedrock inference profiles."""
+    Claude Code skips the keychain-read step that fails in headless subprocess
+    invocations."""
     captured: dict = {}
     proc = _FakeProc([b'{"summary":"ok","findings":[]}\n'], [], 0)
     _patch_subprocess(monkeypatch, proc, captured)

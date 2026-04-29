@@ -10,6 +10,8 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 
+import anthropic
+
 from app.adapters._subprocess import clean_env
 from app.domain.exceptions import ProviderError
 from app.domain.models import Comment, Finding, Review
@@ -80,6 +82,42 @@ def _parse_review_output(output: str) -> Review:
     )
 
 
+def _is_bedrock_inference_profile(model_id: str) -> bool:
+    """Return True for AWS Bedrock model/inference-profile IDs (contain ':')."""
+    return ":" in model_id
+
+
+async def _stream_bedrock_sdk(
+    model: str,
+    prompt: str,
+    timeout: int = 300,
+) -> AsyncGenerator[str, None]:
+    """Stream directly via the Anthropic SDK's Bedrock backend.
+
+    Bypasses the Claude Code CLI entirely, so Claude Code's built-in model
+    registry validation never runs. AWS credentials are taken from the
+    standard environment variables (AWS_REGION, AWS_ACCESS_KEY_ID, etc.)
+    or from ~/.aws/credentials, exactly as the boto3/bedrock SDK expects.
+    """
+    t_start = time.monotonic()
+    logger.info("claude-code | bedrock-sdk | model=%s", model)
+    try:
+        client = anthropic.AsyncAnthropicBedrock()
+        async with client.messages.stream(
+            model=model,
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            async for chunk in stream.text_stream:
+                yield chunk
+    except anthropic.APIError as exc:
+        elapsed = time.monotonic() - t_start
+        logger.error("claude-code | bedrock-sdk | error=%.80s elapsed=%.1fs", exc, elapsed)
+        raise ProviderError(f"Bedrock API error: {exc}") from exc
+    elapsed = time.monotonic() - t_start
+    logger.info("claude-code | bedrock-sdk | done elapsed=%.1fs", elapsed)
+
+
 async def _stream_claude_code(
     message: str,
     context: str | None = None,
@@ -91,12 +129,27 @@ async def _stream_claude_code(
     """Stream raw claude (Claude Code) output line by line.
 
     Uses `claude -p` (print/non-interactive mode) which prints to stdout and exits.
-    The prompt is sent on stdin when long, otherwise as a positional argument —
-    matching the OpenCode adapter's approach so behavior stays comparable.
+    For Bedrock inference profile IDs (containing ':') in read-only flows,
+    delegates to _stream_bedrock_sdk to bypass Claude Code's model validation.
     """
     prompt = message
     if context:
         prompt = f"{message}\n\n---\n\n{context}"
+
+    # Bedrock inference profile IDs (e.g. eu.anthropic.claude-sonnet-4-20250514-v1:0)
+    # contain ':' as a version separator. Claude Code CLI's --bare mode validates
+    # --model against its static registry which doesn't include these profiles,
+    # so they fail with "may not exist" even when available on Bedrock. For
+    # read-only flows, bypass the CLI entirely and call Bedrock via the SDK.
+    if model and not allow_edits:
+        cli_model = model.split("/", 1)[1] if "/" in model else model
+        if _is_bedrock_inference_profile(cli_model):
+            logger.info(
+                "claude-code | bedrock-profile | routing to sdk | model=%s", cli_model
+            )
+            async for chunk in _stream_bedrock_sdk(cli_model, prompt, timeout):
+                yield chunk
+            return
 
     prompt_kb = len(prompt.encode()) / 1024
     logger.info(
@@ -108,18 +161,7 @@ async def _stream_claude_code(
     subprocess_env = clean_env()
     extra_args: list[str] = ["-p", "--output-format", "text"]
     if model:
-        # Strip OpenCode/OpenRouter-style 'provider/model' prefix.
         cli_model = model.split("/", 1)[1] if "/" in model else model
-        # Register the model as a custom option before passing --model.
-        # In --bare mode Claude Code validates --model against its built-in
-        # static registry, which doesn't include Bedrock cross-region
-        # inference profile IDs like eu.anthropic.claude-sonnet-4-20250514-v1:0
-        # (non-bare mode fetches the live list from Bedrock; --bare skips that
-        # prefetch and falls back to the static list). ANTHROPIC_CUSTOM_MODEL_OPTION
-        # adds the ID to the registry before validation runs, so --model finds
-        # it and passes. Without this, Claude Code rejects inference profiles
-        # with a misleading "may not exist or you may not have access" error
-        # even when the model is available on Bedrock.
         subprocess_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = cli_model
         extra_args += ["--model", cli_model]
     if allow_edits:

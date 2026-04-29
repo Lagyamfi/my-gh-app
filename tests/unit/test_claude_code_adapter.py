@@ -9,6 +9,7 @@ from app.adapters.ai.claude_code_adapter import (
     _parse_review_output,
     _stream_claude_code,
     list_models,
+    parse_model_suggestion,
 )
 from app.domain.exceptions import ProviderError
 from app.ports.ai_provider import (
@@ -55,45 +56,30 @@ class TestParseReviewOutput:
 
 
 class TestListModels:
-    def test_returns_aliases_when_claude_not_on_path(self, monkeypatch):
-        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: None)
-        result = list_models()
-        assert result == ["opus", "sonnet", "haiku"]
+    def test_returns_three_universal_aliases(self):
+        assert list_models() == ["opus", "sonnet", "haiku"]
 
-    def test_returns_aliases_on_binary_read_error(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: str(tmp_path / "no-such-file"))
-        result = list_models()
-        assert result == ["opus", "sonnet", "haiku"]
+    def test_does_not_contain_versioned_ids(self):
+        # Versioned IDs (e.g. "claude-sonnet-4-6") are backend-specific and
+        # break on Bedrock/Vertex deployments — only aliases are returned.
+        assert not any("-" in m for m in list_models())
 
-    def test_extracts_versioned_ids_from_binary(self, monkeypatch, tmp_path):
-        fake_bin = tmp_path / "claude"
-        # Embed known model IDs alongside garbage bytes
-        fake_bin.write_bytes(
-            b"\x00some-garbage\x00"
-            b"claude-sonnet-4-6\x00"
-            b"claude-opus-4-7\x00"
-            b"claude-haiku-4-5-20251001\x00"
-            b"not-a-model\x00"
-            b"claude-opus-4(?!-regex)\x00"  # regex artifact — must be filtered out
-        )
-        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: str(fake_bin))
-        result = list_models()
-        assert "opus" in result
-        assert "sonnet" in result
-        assert "haiku" in result
-        assert "claude-sonnet-4-6" in result
-        assert "claude-opus-4-7" in result
-        assert "claude-haiku-4-5-20251001" in result
-        # Regex artifact must be excluded
-        assert not any("?" in m or "!" in m for m in result)
 
-    def test_aliases_come_before_versioned_ids(self, monkeypatch, tmp_path):
-        fake_bin = tmp_path / "claude"
-        fake_bin.write_bytes(b"claude-sonnet-4-6\x00claude-opus-4-7\x00")
-        monkeypatch.setattr(claude_code_adapter.shutil, "which", lambda _: str(fake_bin))
-        result = list_models()
-        assert result.index("opus") < result.index("claude-opus-4-7")
-        assert result.index("sonnet") < result.index("claude-sonnet-4-6")
+class TestParseModelSuggestion:
+    def test_parses_bedrock_eu_suggestion(self):
+        line = "API Error (claude-sonnet-4-6): 400 The provided model identifier is invalid.. Try --model to switch to eu.anthropic.claude-sonnet-4-5-20250929-v1:0."
+        assert parse_model_suggestion(line) == "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+    def test_parses_generic_switch_suggestion(self):
+        line = "Run --model to pick a different model."
+        assert parse_model_suggestion(line) is None
+
+    def test_returns_none_when_no_suggestion(self):
+        assert parse_model_suggestion("Authentication error") is None
+
+    def test_strips_trailing_period(self):
+        line = "Try --model to switch to us.anthropic.claude-opus-4-20250514-v1:0."
+        assert parse_model_suggestion(line) == "us.anthropic.claude-opus-4-20250514-v1:0"
 
 
 def _async_iter_strings(items):

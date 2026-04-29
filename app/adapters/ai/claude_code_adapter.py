@@ -8,7 +8,6 @@ import asyncio
 import json
 import logging
 import re
-import shutil
 import time
 from collections.abc import AsyncGenerator
 
@@ -48,40 +47,31 @@ Read the relevant files, understand the issue, and EDIT the files to implement t
 Make minimal, targeted changes. Do NOT create new files unless absolutely necessary.
 Do NOT run tests or build commands — just make the code changes."""
 
-# Bytes regex matching versioned Claude model IDs embedded in the claude binary
-# (e.g. b"claude-sonnet-4-6", b"claude-opus-4-7", b"claude-haiku-4-5-20251001")
-_BINARY_MODEL_RE = re.compile(rb"claude-(?:opus|sonnet|haiku)-\d+(?:-\d+)+")
+# Parses Claude Code's "Try --model to switch to <id>" suggestion from error output.
+_SUGGESTION_RE = re.compile(r"--model to switch to ([\w.:/-]+)")
 
 
 def list_models() -> list[str]:
-    """Return model IDs known to the installed claude binary.
+    """Return the model names accepted by the installed claude CLI.
 
-    Scans the binary for embedded model name patterns — 100% local, no
-    network call required. Falls back to the three canonical aliases if the
-    binary cannot be read or is not on PATH.
+    Returns the three universal aliases — opus, sonnet, haiku — which Claude
+    Code maps to the appropriate backend-specific model ID automatically,
+    regardless of whether the backend is the Anthropic API, AWS Bedrock
+    (any region), Vertex AI, etc.
+
+    Versioned IDs such as "claude-sonnet-4-6" are NOT returned because they
+    are Anthropic-API-specific and break on Bedrock/Vertex deployments where
+    the equivalent ID has a different format (e.g. the Bedrock EU inference
+    profile "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"). Users who need
+    a specific pinned ID can enter it via the UI's free-form custom input.
     """
-    aliases = ["opus", "sonnet", "haiku"]
-    claude_path = shutil.which("claude")
-    if not claude_path:
-        return aliases
-    try:
-        with open(claude_path, "rb") as fh:
-            data = fh.read()
-        raw = {m.decode() for m in _BINARY_MODEL_RE.findall(data)}
-        # Keep only clean IDs (all chars are alphanumeric or hyphen)
-        clean = {m for m in raw if re.fullmatch(r"[a-z0-9-]+", m)}
+    return ["opus", "sonnet", "haiku"]
 
-        def _sort_key(name: str) -> tuple[int, str]:
-            for i, family in enumerate(("opus", "sonnet", "haiku")):
-                if family in name:
-                    return (i, name)
-            return (3, name)
 
-        versioned = sorted(clean, key=_sort_key)
-        logger.info("claude-code | list_models | found=%d from binary", len(versioned))
-    except OSError:
-        versioned = []
-    return aliases + [m for m in versioned if m not in set(aliases)]
+def parse_model_suggestion(text: str) -> str | None:
+    """Extract a model ID from a Claude Code 'Try --model to switch to X' hint."""
+    m = _SUGGESTION_RE.search(text)
+    return m.group(1).rstrip(".") if m else None
 
 
 def _parse_review_output(output: str) -> Review:

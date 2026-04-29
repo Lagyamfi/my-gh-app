@@ -158,6 +158,7 @@ async def _stream_claude_code(
 
     stderr_task = asyncio.create_task(_read_stderr())
     output_lines = 0
+    stdout_capture: list[str] = []  # for surfacing as a warning when rc != 0
 
     while True:
         try:
@@ -172,6 +173,7 @@ async def _stream_claude_code(
             break
         decoded = line.decode()
         output_lines += 1
+        stdout_capture.append(decoded)
         logger.debug("claude-code | stdout | %s", decoded.rstrip())
         yield decoded
 
@@ -191,6 +193,17 @@ async def _stream_claude_code(
             warning_lines.insert(0, f"[claude exited with code {rc} and produced no output]")
         else:
             warning_lines.insert(0, f"[claude exited with code {rc}]")
+            # Promote stdout into the warning channel — when claude fails fast
+            # (e.g. authentication error) it usually prints the reason to
+            # stdout, not stderr. Surfacing it here makes the error visible in
+            # the UI's warning panel instead of being buried in raw_output.
+            captured = "".join(stdout_capture).strip()
+            if captured:
+                warning_lines.append("[claude stdout]")
+                # Cap at ~40 lines / 4 KB so a runaway log doesn't flood the UI.
+                snippet = captured[:4000]
+                for cap_line in snippet.splitlines()[:40]:
+                    warning_lines.append(cap_line)
 
     for err_line in warning_lines:
         yield f"\x00STDERR\x00{err_line}"

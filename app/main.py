@@ -498,7 +498,10 @@ async def stream_review(
             yield 'data: {"type": "done"}\n\n'
         except Exception as e:
             logger.exception("stream_review | failed | repo=%s/%s pr=#%d", owner, repo, pr_number)
-            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+            # Field name is `message` to match the frontend's SSEReviewEvent
+            # contract — `text` was a regression that left the UI showing an
+            # empty error box.
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             yield 'data: {"type": "done"}\n\n'
 
     return StreamingResponse(

@@ -207,17 +207,58 @@ async def test_stream_claude_code_passes_unprefixed_model_through(monkeypatch):
     assert args[args.index("--model") + 1] == "claude-opus-4-7"
 
 
-async def test_stream_claude_code_warns_on_nonzero_exit_with_output(monkeypatch):
+async def test_stream_claude_code_warns_then_raises_on_nonzero_exit_with_output(monkeypatch):
+    """rc != 0 must yield warnings (so the UI's ⚠ panel can show them) AND
+    then raise ProviderError so the SSE pipeline emits a top-level `error`
+    event the user can see."""
+    from app.domain.exceptions import ProviderError
+
     captured: dict = {}
     error_msg = b"There's an issue with the selected model (foo). It may not exist...\n"
     proc = _FakeProc([error_msg], [], 1)
     _patch_subprocess(monkeypatch, proc, captured)
 
     chunks = []
-    async for chunk in _stream_claude_code("short prompt"):
-        chunks.append(chunk)
+    with pytest.raises(ProviderError, match="claude exited with code 1"):
+        async for chunk in _stream_claude_code("short prompt"):
+            chunks.append(chunk)
 
     stderr_chunks = [c for c in chunks if c.startswith("\x00STDERR\x00")]
     assert any("exited with code 1" in c for c in stderr_chunks), (
-        f"expected a non-zero-exit warning even when stdout had output, got {chunks!r}"
+        f"expected a non-zero-exit warning to be yielded before the raise, got {chunks!r}"
     )
+    # The captured stdout should also be promoted into the warning channel.
+    assert any("issue with the selected model" in c for c in stderr_chunks), (
+        f"expected stdout content to be surfaced as a warning, got {stderr_chunks!r}"
+    )
+
+
+async def test_stream_claude_code_raises_on_nonzero_exit_with_no_output(monkeypatch):
+    """rc != 0 with empty stdout still raises so the UI shows the failure."""
+    from app.domain.exceptions import ProviderError
+
+    captured: dict = {}
+    proc = _FakeProc([], [b"some stderr complaint\n"], 1)
+    _patch_subprocess(monkeypatch, proc, captured)
+
+    with pytest.raises(ProviderError, match="claude exited with code 1"):
+        async for _ in _stream_claude_code("short prompt"):
+            pass
+
+
+async def test_stream_claude_code_always_uses_positional_arg(monkeypatch):
+    """Large prompts must still be passed as a positional argument — claude's
+    `-p` mode does not reliably consume stdin, so we never use the stdin path."""
+    captured: dict = {}
+    proc = _FakeProc([b'{"summary":"ok","findings":[]}\n'], [], 0)
+    _patch_subprocess(monkeypatch, proc, captured)
+
+    big_prompt = "x" * 50_000  # well over the previous 4 KB stdin threshold
+    async for _ in _stream_claude_code(big_prompt):
+        pass
+
+    # The prompt should appear as the last positional argument.
+    args = captured["args"]
+    assert args[-1] == big_prompt
+    # And we should NOT have asked for a stdin pipe.
+    assert "stdin" not in captured["kwargs"]

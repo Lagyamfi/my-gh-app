@@ -119,26 +119,17 @@ async def _stream_claude_code(
     if allow_edits:
         extra_args += ["--dangerously-skip-permissions"]
 
-    if len(prompt) > 4000:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", *extra_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=clean_env(),
-        )
-        if proc.stdin is not None:
-            proc.stdin.write(prompt.encode())
-            proc.stdin.close()
-    else:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", *extra_args, prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=clean_env(),
-        )
+    # Always pass the prompt as a positional argument. The `claude` CLI's
+    # `-p` (print) mode does not reliably consume stdin in some installs —
+    # it exits ~1.5s with a short error message printed to stdout. Linux
+    # ARG_MAX is ~2 MB so a 30 KB review prompt fits comfortably.
+    proc = await asyncio.create_subprocess_exec(
+        "claude", *extra_args, prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=clean_env(),
+    )
 
     if proc.stdout is None or proc.stderr is None:
         raise ProviderError("claude subprocess did not open stdout/stderr")
@@ -188,6 +179,7 @@ async def _stream_claude_code(
     stderr_lines = await stderr_task
 
     warning_lines = list(stderr_lines)
+    captured_stdout = "".join(stdout_capture).strip()
     if rc != 0:
         if output_lines == 0:
             warning_lines.insert(0, f"[claude exited with code {rc} and produced no output]")
@@ -197,16 +189,36 @@ async def _stream_claude_code(
             # (e.g. authentication error) it usually prints the reason to
             # stdout, not stderr. Surfacing it here makes the error visible in
             # the UI's warning panel instead of being buried in raw_output.
-            captured = "".join(stdout_capture).strip()
-            if captured:
+            if captured_stdout:
                 warning_lines.append("[claude stdout]")
                 # Cap at ~40 lines / 4 KB so a runaway log doesn't flood the UI.
-                snippet = captured[:4000]
+                snippet = captured_stdout[:4000]
                 for cap_line in snippet.splitlines()[:40]:
                     warning_lines.append(cap_line)
 
     for err_line in warning_lines:
         yield f"\x00STDERR\x00{err_line}"
+
+    # Fail loud: a non-zero exit means claude couldn't produce a usable
+    # response. Raise so the SSE pipeline emits an `error` event and the UI
+    # shows it prominently instead of presenting a hollow "0 findings" review.
+    if rc != 0:
+        # Build a one-line summary the user will actually read in the UI.
+        first_stdout_line = next(
+            (line for line in captured_stdout.splitlines() if line.strip()), ""
+        )
+        first_stderr_line = next(
+            (line for line in stderr_lines if line.strip()), ""
+        )
+        detail = first_stdout_line or first_stderr_line or "(no output)"
+        # Keep the detail short — full text is in warnings + raw_output.
+        if len(detail) > 200:
+            detail = detail[:197] + "..."
+        logger.error(
+            "claude-code | failed | exit=%s | first_line=%r",
+            rc, detail,
+        )
+        raise ProviderError(f"claude exited with code {rc}: {detail}")
 
 
 class ClaudeCodeAdapter(AIProvider):

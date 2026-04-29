@@ -189,13 +189,16 @@ async def test_stream_claude_code_strips_provider_prefix_from_model(monkeypatch)
     ):
         chunks.append(chunk)
 
-    # Model is passed via ANTHROPIC_MODEL env var (not --model flag) to bypass
-    # Claude Code's static model registry check that rejects some valid Bedrock
-    # cross-region inference profile IDs in --bare mode.
+    # Model is registered via ANTHROPIC_CUSTOM_MODEL_OPTION so Claude Code's
+    # static registry (used in --bare mode) accepts Bedrock inference profile
+    # IDs that aren't in the built-in list. The --model flag is still passed
+    # so Claude Code selects the right model for the session.
     env = captured["kwargs"]["env"]
-    assert env["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
-    assert "--model" not in captured["args"]
-    assert "anthropic/claude-sonnet-4-6" not in captured["args"]
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "claude-sonnet-4-6"
+    args = captured["args"]
+    assert "--model" in args
+    assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
+    assert "anthropic/claude-sonnet-4-6" not in args
 
 
 async def test_stream_claude_code_passes_unprefixed_model_through(monkeypatch):
@@ -206,8 +209,10 @@ async def test_stream_claude_code_passes_unprefixed_model_through(monkeypatch):
     async for _ in _stream_claude_code("short prompt", model="claude-opus-4-7"):
         pass
 
-    assert captured["kwargs"]["env"]["ANTHROPIC_MODEL"] == "claude-opus-4-7"
-    assert "--model" not in captured["args"]
+    env = captured["kwargs"]["env"]
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "claude-opus-4-7"
+    args = captured["args"]
+    assert args[args.index("--model") + 1] == "claude-opus-4-7"
 
 
 async def test_stream_claude_code_uses_bare_for_read_only_flows(monkeypatch):

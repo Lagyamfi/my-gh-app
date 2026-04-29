@@ -110,17 +110,18 @@ async def _stream_claude_code(
     if model:
         # Strip OpenCode/OpenRouter-style 'provider/model' prefix.
         cli_model = model.split("/", 1)[1] if "/" in model else model
-        # Inject model via env var rather than --model CLI flag.
-        # The --model flag validates against Claude Code's built-in static
-        # model registry, which in --bare mode rejects some valid Bedrock
-        # cross-region inference profiles (e.g.
-        # eu.anthropic.claude-sonnet-4-20250514-v1:0) that are not listed
-        # there (non-bare mode fetches the list live from Bedrock, bare mode
-        # skips that prefetch). ANTHROPIC_MODEL bypasses the CLI validation
-        # layer; the underlying Bedrock SDK then handles the model ID
-        # directly, so Bedrock's own "not available" error surfaces instead
-        # of Claude Code's misleading "may not exist" rejection.
-        subprocess_env["ANTHROPIC_MODEL"] = cli_model
+        # Register the model as a custom option before passing --model.
+        # In --bare mode Claude Code validates --model against its built-in
+        # static registry, which doesn't include Bedrock cross-region
+        # inference profile IDs like eu.anthropic.claude-sonnet-4-20250514-v1:0
+        # (non-bare mode fetches the live list from Bedrock; --bare skips that
+        # prefetch and falls back to the static list). ANTHROPIC_CUSTOM_MODEL_OPTION
+        # adds the ID to the registry before validation runs, so --model finds
+        # it and passes. Without this, Claude Code rejects inference profiles
+        # with a misleading "may not exist or you may not have access" error
+        # even when the model is available on Bedrock.
+        subprocess_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = cli_model
+        extra_args += ["--model", cli_model]
     if allow_edits:
         # Fix flow: keep CLAUDE.md auto-discovery, hooks, plugins so claude
         # has project context while editing, and bypass per-tool prompts.

@@ -326,19 +326,75 @@ def set_provider(data: ProviderSelect):
     )}
 
 
+_CLAUDE_ALIASES: tuple[str, ...] = ("opus", "sonnet", "haiku")
+
+
+def _discover_claude_models() -> list[str]:
+    """Best-effort discovery of model identifiers configured for Claude Code.
+
+    Order (most-specific first, then aliases):
+
+    1. ``ANTHROPIC_MODEL`` env var — what the CLI itself uses by default.
+    2. Project-local ``.claude/settings.local.json`` ``model`` field.
+    3. Project ``.claude/settings.json`` ``model`` field.
+    4. User ``~/.claude/settings.json`` ``model`` field.
+    5. Well-known aliases (``opus``/``sonnet``/``haiku``).
+
+    Bedrock / custom deployments use fully-qualified model IDs that the
+    aliases can't resolve, so we surface whatever the user already has
+    configured. The caller can also enter an arbitrary ID via the UI's
+    "Custom…" option.
+    """
+    candidates: list[str] = []
+
+    env_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+    if env_model:
+        candidates.append(env_model)
+
+    settings_paths = [
+        Path.cwd() / ".claude" / "settings.local.json",
+        Path.cwd() / ".claude" / "settings.json",
+        Path.home() / ".claude" / "settings.json",
+    ]
+    for path in settings_paths:
+        try:
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            model = data.get("model")
+            if isinstance(model, str) and model.strip():
+                candidates.append(model.strip())
+
+    candidates.extend(_CLAUDE_ALIASES)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+
 @app.get("/api/models")
 def list_models():
-    """Return all models available in the active AI provider's installation."""
+    """Return all models available in the active AI provider's installation.
+
+    For ``claude-code`` we can't query the CLI directly (it has no
+    ``models`` listing command), so we discover candidates from the user's
+    Claude Code config and env, plus the aliases. The frontend lets the
+    user override with a free-form custom value when none of these are
+    valid for their deployment (e.g. a pinned Bedrock model ID).
+    """
     import subprocess
     active = _ai.active
     if active == "opencode":
         cmd = ["opencode", "models"]
     elif active == "claude-code":
-        # Claude Code does not expose a `models` listing command, and pinned
-        # version names (e.g. 'claude-opus-4-7') are rejected by older CLI
-        # installs or accounts without access to that exact version. Aliases
-        # always resolve to the latest model the user's CLI supports.
-        return {"models": ["opus", "sonnet", "haiku"]}
+        return {"models": _discover_claude_models()}
     else:
         raise HTTPException(status_code=500, detail=f"Unknown provider {active!r}")
 

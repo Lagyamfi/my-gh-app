@@ -162,3 +162,100 @@ def test_models_returns_empty_with_warning_when_cli_missing(client):
     body = res.json()
     assert body["models"] == []
     assert "warning" in body
+
+
+# --- Claude model discovery ---
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    """Isolate $HOME and CWD so the discovery doesn't read the dev's real config."""
+    home = tmp_path / "home"
+    cwd = tmp_path / "work"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    return home, cwd
+
+
+def test_discover_claude_models_falls_back_to_aliases(isolated_home):
+    from app.main import _discover_claude_models, _CLAUDE_ALIASES
+
+    assert _discover_claude_models() == list(_CLAUDE_ALIASES)
+
+
+def test_discover_claude_models_picks_up_anthropic_model_env(isolated_home, monkeypatch):
+    from app.main import _discover_claude_models
+
+    monkeypatch.setenv("ANTHROPIC_MODEL", "eu.anthropic.claude-sonnet-4-20250514-v1:0")
+    models = _discover_claude_models()
+    assert models[0] == "eu.anthropic.claude-sonnet-4-20250514-v1:0"
+    # Aliases still appended after the discovered ID.
+    assert "sonnet" in models
+
+
+def test_discover_claude_models_reads_user_settings(isolated_home):
+    from app.main import _discover_claude_models
+
+    home, _ = isolated_home
+    settings_dir = home / ".claude"
+    settings_dir.mkdir()
+    (settings_dir / "settings.json").write_text(
+        '{"model": "us.anthropic.claude-opus-4-20250101-v1:0"}'
+    )
+
+    models = _discover_claude_models()
+    assert "us.anthropic.claude-opus-4-20250101-v1:0" in models
+    # Order: discovery first, aliases last.
+    assert models.index("us.anthropic.claude-opus-4-20250101-v1:0") < models.index("opus")
+
+
+def test_discover_claude_models_project_overrides_user(isolated_home):
+    from app.main import _discover_claude_models
+
+    home, cwd = isolated_home
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text('{"model": "user-level-model"}')
+    (cwd / ".claude").mkdir()
+    (cwd / ".claude" / "settings.json").write_text('{"model": "project-level-model"}')
+
+    models = _discover_claude_models()
+    # Both are present, but project-level comes first.
+    assert models.index("project-level-model") < models.index("user-level-model")
+
+
+def test_discover_claude_models_dedupes(isolated_home, monkeypatch):
+    from app.main import _discover_claude_models
+
+    monkeypatch.setenv("ANTHROPIC_MODEL", "sonnet")
+    models = _discover_claude_models()
+    # "sonnet" must appear exactly once even though it's both an env value and an alias.
+    assert models.count("sonnet") == 1
+
+
+def test_discover_claude_models_ignores_malformed_settings(isolated_home):
+    from app.main import _discover_claude_models, _CLAUDE_ALIASES
+
+    home, _ = isolated_home
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text("not valid json {")
+
+    # Falls back gracefully to aliases; doesn't raise.
+    assert _discover_claude_models() == list(_CLAUDE_ALIASES)
+
+
+def test_models_endpoint_uses_discovery_for_claude_code(client, isolated_home, monkeypatch):
+    from app.main import _CLAUDE_ALIASES
+
+    monkeypatch.setenv("ANTHROPIC_MODEL", "eu.anthropic.claude-sonnet-4-20250514-v1:0")
+    client.post("/api/provider", json={"name": "claude-code"})
+    res = client.get("/api/models")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["models"][0] == "eu.anthropic.claude-sonnet-4-20250514-v1:0"
+    for alias in _CLAUDE_ALIASES:
+        assert alias in body["models"]
+    # Restore.
+    client.post("/api/provider", json={"name": "opencode"})

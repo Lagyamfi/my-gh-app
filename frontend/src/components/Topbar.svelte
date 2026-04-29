@@ -100,12 +100,53 @@
     })();
   });
 
-  function onModelChange(value: string): void {
+  // The dropdown's reserved value used for "let me type a custom model id".
+  const CUSTOM_SENTINEL = '__custom__';
+
+  let customMode = $state(false);
+  let customDraft = $state('');
+  let customInput = $state<HTMLInputElement | null>(null);
+
+  function persistModel(value: string): void {
     selectedModel.set(value);
     if (currentProvider) {
       localStorage.setItem(modelStorageKey(currentProvider), value);
     }
   }
+
+  function onModelChange(value: string): void {
+    if (value === CUSTOM_SENTINEL) {
+      // Switch the row into the free-form input. Keep the existing custom
+      // value (if any) as the draft so the user sees what they had.
+      customDraft = $selectedModel || '';
+      customMode = true;
+      // Focus the input on the next tick after Svelte has rendered it.
+      queueMicrotask(() => customInput?.focus());
+      return;
+    }
+    customMode = false;
+    persistModel(value);
+  }
+
+  function commitCustom(): void {
+    const trimmed = customDraft.trim();
+    customMode = false;
+    persistModel(trimmed);
+  }
+
+  function cancelCustom(): void {
+    customMode = false;
+    // Don't change selectedModel — the dropdown's `value` binding will
+    // re-sync against whatever was persisted.
+  }
+
+  // When the model is changed elsewhere (e.g. provider switch resets it to
+  // ""), make sure we exit custom mode so the dropdown doesn't get stuck.
+  $effect(() => {
+    const m = $selectedModel;
+    const isInList = availableModels.includes(m);
+    if (m === '' || isInList) customMode = false;
+  });
 
   function goHome(): void {
     activeRepo.set(null);
@@ -124,6 +165,17 @@
     !!$providersStatus && ($providersStatus.available[$providersStatus.active] ?? false),
   );
   let providerLabel = $derived($aiProvider || 'no provider');
+
+  // Decide what the <select> should show. Three cases:
+  //   1. No model picked → "<provider> default" (value="")
+  //   2. Picked model is in availableModels → highlight it
+  //   3. Picked model is custom (non-empty, not in list) OR user just opened
+  //      the custom input → CUSTOM_SENTINEL highlights "Custom…"
+  let dropdownValue = $derived(
+    customMode || ($selectedModel !== '' && !availableModels.includes($selectedModel))
+      ? CUSTOM_SENTINEL
+      : $selectedModel,
+  );
 </script>
 
 <header class="topbar">
@@ -161,17 +213,38 @@
 
   <div class="model-selector">
     <span class="model-label">Model</span>
-    <select
-      class="model-select"
-      value={$selectedModel}
-      onchange={(e) => onModelChange((e.target as HTMLSelectElement).value)}
-      disabled={!$aiProvider}
-    >
-      <option value="">{$aiProvider ? `${$aiProvider} default` : 'no provider'}</option>
-      {#each availableModels as m}
-        <option value={m}>{m}</option>
-      {/each}
-    </select>
+    {#if customMode}
+      <input
+        bind:this={customInput}
+        bind:value={customDraft}
+        class="model-input"
+        type="text"
+        placeholder="model id, e.g. eu.anthropic.claude-sonnet-4-20250514-v1:0"
+        onblur={commitCustom}
+        onkeydown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commitCustom(); }
+          else if (e.key === 'Escape') { e.preventDefault(); cancelCustom(); }
+        }}
+      />
+    {:else}
+      <select
+        class="model-select"
+        value={dropdownValue}
+        onchange={(e) => onModelChange((e.target as HTMLSelectElement).value)}
+        disabled={!$aiProvider}
+        title={$selectedModel || ($aiProvider ? `${$aiProvider} default` : 'no provider')}
+      >
+        <option value="">{$aiProvider ? `${$aiProvider} default` : 'no provider'}</option>
+        {#each availableModels as m}
+          <option value={m}>{m}</option>
+        {/each}
+        {#if $selectedModel !== '' && !availableModels.includes($selectedModel)}
+          <option value={CUSTOM_SENTINEL}>{$selectedModel} (custom)</option>
+        {:else}
+          <option value={CUSTOM_SENTINEL}>Custom…</option>
+        {/if}
+      </select>
+    {/if}
   </div>
 </header>
 
@@ -304,4 +377,18 @@
   }
   .model-select:hover { border-color: rgba(255,107,53,0.4); color: var(--text-primary); }
   .model-select:focus { outline: none; border-color: var(--accent); }
+  .model-input {
+    background: var(--glass-bg);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    width: 360px;
+    max-width: 50vw;
+    outline: none;
+  }
+  .model-input::placeholder { color: var(--text-muted); }
+  .model-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(255,107,53,0.15); }
 </style>

@@ -9,6 +9,7 @@
   import EmptyState from './components/EmptyState.svelte';
   import PRList from './components/PRList.svelte';
   import PRDetail from './components/PRDetail.svelte';
+  import ProviderModal from './components/ProviderModal.svelte';
   import Toast from './components/Toast.svelte';
 
   onMount(() => { loadRepos(); });
@@ -35,6 +36,8 @@
     {/if}
   </main>
 </div>
+
+<ProviderModal />
 
 {#each $toasts as toast (toast.id)}
   <Toast {toast} />

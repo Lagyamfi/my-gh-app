@@ -8,6 +8,21 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Runtime AI provider picker** — a modal lets the user switch between
+  `opencode` and `claude-code` without restarting the server or setting an
+  env var. The active provider is reflected immediately in the topbar and
+  the model selector is refreshed automatically.
+- **Provider availability detection** at startup — the server checks each
+  provider's CLI on `PATH` (`opencode`, `claude`) and logs a warning if
+  the active one is missing. The warning is also surfaced as a toast in
+  the UI.
+- `GET /api/providers` — returns active provider, env-var origin, supported
+  list, and per-provider availability.
+- `POST /api/provider` — switches the active provider for the running
+  server. Responds with a `warning` field when the picked provider's CLI
+  is not on `PATH`.
+- `httpx` added as a dev dependency (used by FastAPI's `TestClient` for
+  the new endpoint tests).
 - **Claude Code** as a selectable AI provider (`AI_PROVIDER=claude-code`)
 - Active AI provider surfaced in the UI alongside a model picker for both
   providers, persisted to localStorage
@@ -23,12 +38,28 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `.env.example` documenting that no environment variables are required
 
 ### Changed
+- The provider badge in the topbar is now an always-visible button —
+  clicking it opens the provider picker. It turns red with a `!` when the
+  active provider's CLI is missing.
+- The model selector is now always rendered (even before the provider
+  status loads). When no provider has been resolved yet, it's disabled
+  with a placeholder; otherwise it offers the provider's models plus a
+  "<provider> default" option that omits the `--model` flag entirely.
+- `AI_PROVIDER` is no longer required: when unset, the server picks the
+  first provider whose CLI is on `PATH`.
+- `/api/config` now also returns a nested `providers` block (active,
+  available, from_env, supported, clis) for richer frontend state.
 - README: added feature highlights, table of contents, CI badge, AI-provider
   switching guide, configuration table, troubleshooting, and "adapting for
   your needs" guide
 - `.gitignore`: added `.env`, `build/`, `*.egg-info/` patterns
 
 ### Fixed
+- Topbar no longer hides the provider badge / model selector when
+  `/api/config` returns an empty active provider — both are always visible
+  so the user can recover via the picker.
+- `/api/models` no longer 500s when the active provider's CLI is missing;
+  it returns an empty model list and a `warning` field.
 - Claude Code review API failing on opencode-style `provider/model` names —
   the provider prefix is now stripped before being passed to the `claude` CLI
 

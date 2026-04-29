@@ -105,14 +105,22 @@ async def _stream_claude_code(
     )
     t_start = time.monotonic()
 
+    subprocess_env = clean_env()
     extra_args: list[str] = ["-p", "--output-format", "text"]
     if model:
-        # The Claude Code CLI accepts aliases ('sonnet') or full names
-        # ('claude-sonnet-4-6'), but rejects OpenCode/OpenRouter-style
-        # 'provider/model' identifiers. Strip the provider prefix so a
-        # value like 'anthropic/claude-sonnet-4-6' still works.
+        # Strip OpenCode/OpenRouter-style 'provider/model' prefix.
         cli_model = model.split("/", 1)[1] if "/" in model else model
-        extra_args += ["--model", cli_model]
+        # Inject model via env var rather than --model CLI flag.
+        # The --model flag validates against Claude Code's built-in static
+        # model registry, which in --bare mode rejects some valid Bedrock
+        # cross-region inference profiles (e.g.
+        # eu.anthropic.claude-sonnet-4-20250514-v1:0) that are not listed
+        # there (non-bare mode fetches the list live from Bedrock, bare mode
+        # skips that prefetch). ANTHROPIC_MODEL bypasses the CLI validation
+        # layer; the underlying Bedrock SDK then handles the model ID
+        # directly, so Bedrock's own "not available" error surfaces instead
+        # of Claude Code's misleading "may not exist" rejection.
+        subprocess_env["ANTHROPIC_MODEL"] = cli_model
     if allow_edits:
         # Fix flow: keep CLAUDE.md auto-discovery, hooks, plugins so claude
         # has project context while editing, and bypass per-tool prompts.
@@ -138,7 +146,7 @@ async def _stream_claude_code(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env=clean_env(),
+        env=subprocess_env,
     )
 
     if proc.stdout is None or proc.stderr is None:

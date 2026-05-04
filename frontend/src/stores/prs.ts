@@ -110,13 +110,18 @@ export async function publishFinding(
     const inlineComments = finding.file && finding.line != null
       ? [{ path: finding.file, line: finding.line, body }]
       : [];
-    await api.post('/review/publish', {
+    const result = await api.post<{ status: string; warning?: string }>('/review/publish', {
       repo: fullRepo,
       pr_number: prNumber,
       body: inlineComments.length > 0 ? reviewBody : body,
       event: 'REQUEST_CHANGES',
       comments: inlineComments,
     });
+    if (result.warning) {
+      // Backend folded the inline comment into the body because GitHub
+      // rejected it. Caller can still report success — review is published.
+      console.warn('[publishFinding]', result.warning);
+    }
     return;
   }
 
@@ -142,7 +147,7 @@ export async function publishStagedReview(
   repo: string,
   prNumber: number,
   reviewBody: string
-): Promise<void> {
+): Promise<{ warning?: string }> {
   const fullRepo = `${owner}/${repo}`;
   const staged = get(stagedReviewFindings);
   if (staged.length === 0) {
@@ -173,7 +178,7 @@ export async function publishStagedReview(
   }
   body += footer;
 
-  await api.post('/review/publish', {
+  const result = await api.post<{ status: string; warning?: string }>('/review/publish', {
     repo: fullRepo,
     pr_number: prNumber,
     body,
@@ -181,6 +186,7 @@ export async function publishStagedReview(
     comments: inlineComments,
   });
   stagedReviewFindings.set([]);
+  return { warning: result.warning };
 }
 
 // ── Internal types for raw API responses ──

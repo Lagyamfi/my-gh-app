@@ -554,7 +554,14 @@ def publish_review(data: PublishReview, svc: CommentService = Depends(get_commen
             data.event,
             [c.model_dump() for c in data.comments],
         )
-        return {"status": "published", "url": result.get("html_url"), "id": result.get("id")}
+        response = {"status": "published", "url": result.get("html_url"), "id": result.get("id")}
+        if result.get("_fallback_applied"):
+            response["warning"] = (
+                "GitHub rejected one or more inline comments (line outside the PR "
+                "diff). The review was published with the findings folded into the "
+                "review body instead."
+            )
+        return response
     except Exception as e:
         logger.exception("publish_review | failed | repo=%s pr=#%d", data.repo, data.pr_number)
         raise HTTPException(status_code=500, detail=str(e))

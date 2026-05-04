@@ -25,10 +25,14 @@
     busy = true;
     errorMsg = '';
     try {
-      await publishStagedReview(repo.owner, repo.name, pr.number, summary);
+      const result = await publishStagedReview(repo.owner, repo.name, pr.number, summary);
       summary = '';
       publishReviewsModalOpen.set(false);
-      showToast(`Review published as Request Changes`, 'success');
+      if (result.warning) {
+        showToast(result.warning, 'info');
+      } else {
+        showToast(`Review published as Request Changes`, 'success');
+      }
     } catch (e) {
       errorMsg = `Failed to publish review: ${e instanceof Error ? e.message : String(e)}`;
     } finally {

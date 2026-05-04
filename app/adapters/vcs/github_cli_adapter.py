@@ -199,6 +199,41 @@ class GitHubCLIAdapter(VCSPort):
         if commit_id is None:
             commit_id = self.get_pr_head_sha(repo_full_name, pr_number)
 
+        result = self._post_review_payload(repo_full_name, pr_number, body, event, comments, commit_id)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+
+        # 422 most often means at least one inline comment references a line
+        # that isn't in the PR diff (line outside hunk, file is shorter on
+        # head SHA, or AI hallucinated the line number). The reviews endpoint
+        # is all-or-nothing — one bad comment fails the whole batch — so we
+        # fall back to a body-only review with the findings inlined into the
+        # body so the user still gets a REQUEST_CHANGES banner with no data
+        # loss.
+        if "422" in result.stderr and comments:
+            fallback_body = self._fold_comments_into_body(body, comments)
+            retry = self._post_review_payload(
+                repo_full_name, pr_number, fallback_body, event, [], commit_id,
+            )
+            if retry.returncode == 0:
+                parsed = json.loads(retry.stdout)
+                parsed["_fallback_applied"] = True
+                return parsed
+            raise VCSError(
+                f"Failed to create review (fallback also failed): {retry.stderr.strip()}"
+            )
+
+        raise VCSError(f"Failed to create review: {result.stderr.strip()}")
+
+    def _post_review_payload(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[dict],
+        commit_id: str,
+    ) -> "subprocess.CompletedProcess[str]":
         payload = json.dumps({
             "commit_id": commit_id,
             "body": body,
@@ -208,9 +243,8 @@ class GitHubCLIAdapter(VCSPort):
                 for c in comments
             ],
         })
-
         try:
-            result = subprocess.run(
+            return subprocess.run(
                 ["gh", "api", f"repos/{repo_full_name}/pulls/{pr_number}/reviews",
                  "--method", "POST", "--input", "-"],
                 input=payload, capture_output=True, text=True, timeout=60, env=clean_env(),
@@ -218,6 +252,18 @@ class GitHubCLIAdapter(VCSPort):
         except subprocess.TimeoutExpired as e:
             raise VCSError("create_review timed out after 60s") from e
 
-        if result.returncode != 0:
-            raise VCSError(f"Failed to create review: {result.stderr.strip()}")
-        return json.loads(result.stdout)
+    @staticmethod
+    def _fold_comments_into_body(body: str, comments: list[dict]) -> str:
+        """Append inline comments into the review body when GitHub rejects them.
+
+        Used as a fallback when the reviews API returns 422 — typically because
+        a line is outside the PR diff. Keeps each comment readable and pointed
+        at its file/line.
+        """
+        lines: list[str] = [body, "", "**Findings:**", ""]
+        for c in comments:
+            lines.append(f"- `{c['path']}:{c['line']}`")
+            for body_line in str(c["body"]).splitlines():
+                lines.append(f"  {body_line}")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"

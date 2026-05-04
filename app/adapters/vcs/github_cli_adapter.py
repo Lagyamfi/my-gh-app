@@ -1,11 +1,19 @@
 """GitHub CLI implementation of VCSPort."""
 import json
+import re
 import subprocess
+import time
 
 from app.adapters._subprocess import SubprocessError, clean_env, run_subprocess
 from app.domain.exceptions import VCSError
 from app.domain.models import PR
 from app.ports.vcs_port import VCSPort
+
+# Transient HTTP statuses where retrying with backoff is safe and effective.
+# 408 = Request Timeout, 425 = Too Early, 429 = Rate Limited (best-effort),
+# 500/502/503/504 = upstream/gateway hiccups.
+_RETRYABLE_HTTP = re.compile(r"\bHTTP (408|425|429|500|502|503|504)\b")
+_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 4.0)
 
 
 class GitHubCLIAdapter(VCSPort):
@@ -199,7 +207,9 @@ class GitHubCLIAdapter(VCSPort):
         if commit_id is None:
             commit_id = self.get_pr_head_sha(repo_full_name, pr_number)
 
-        result = self._post_review_payload(repo_full_name, pr_number, body, event, comments, commit_id)
+        result = self._post_review_with_retry(
+            repo_full_name, pr_number, body, event, comments, commit_id,
+        )
         if result.returncode == 0:
             return json.loads(result.stdout)
 
@@ -212,7 +222,7 @@ class GitHubCLIAdapter(VCSPort):
         # loss.
         if "422" in result.stderr and comments:
             fallback_body = self._fold_comments_into_body(body, comments)
-            retry = self._post_review_payload(
+            retry = self._post_review_with_retry(
                 repo_full_name, pr_number, fallback_body, event, [], commit_id,
             )
             if retry.returncode == 0:
@@ -224,6 +234,32 @@ class GitHubCLIAdapter(VCSPort):
             )
 
         raise VCSError(f"Failed to create review: {result.stderr.strip()}")
+
+    def _post_review_with_retry(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[dict],
+        commit_id: str,
+    ) -> "subprocess.CompletedProcess[str]":
+        """Retry transient 5xx / rate-limit errors from the reviews endpoint.
+
+        Returns the final ``CompletedProcess``; the caller decides what to do
+        with non-zero exits that aren't transient (e.g. 422 → fold-and-retry).
+        """
+        last = self._post_review_payload(
+            repo_full_name, pr_number, body, event, comments, commit_id,
+        )
+        for delay in _RETRY_DELAYS_S:
+            if last.returncode == 0 or not _RETRYABLE_HTTP.search(last.stderr):
+                return last
+            time.sleep(delay)
+            last = self._post_review_payload(
+                repo_full_name, pr_number, body, event, comments, commit_id,
+            )
+        return last
 
     def _post_review_payload(
         self,

@@ -74,12 +74,13 @@ class TestCreateReview:
                 adapter.create_review("acme/repo", 1, "body", "REQUEST_CHANGES", [])
         assert mock_run.call_count == 1
 
-    def test_raises_on_non_422_error(self, adapter):
-        """500 / network errors should NOT trigger the fallback path."""
+    def test_raises_on_non_retryable_non_422_error(self, adapter):
+        """Permanent errors like 403 should NOT trigger fallback or retry."""
         with patch.object(adapter, "get_pr_head_sha", return_value="abc123"), \
-             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = _err("gh: Internal Server Error (HTTP 500)")
-            with pytest.raises(VCSError, match="500"):
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
+             patch("app.adapters.vcs.github_cli_adapter.time.sleep"):
+            mock_run.return_value = _err("gh: Forbidden (HTTP 403)")
+            with pytest.raises(VCSError, match="403"):
                 adapter.create_review(
                     "acme/repo", 1, "body", "REQUEST_CHANGES",
                     [{"path": "f.py", "line": 1, "body": "x"}],
@@ -89,6 +90,72 @@ class TestCreateReview:
     def test_rejects_invalid_event(self, adapter):
         with pytest.raises(VCSError, match="invalid review event"):
             adapter.create_review("acme/repo", 1, "body", "BLESS", [])
+
+    def test_retries_on_502_then_succeeds(self, adapter):
+        """502 Bad Gateway is a transient GitHub error — retry with backoff."""
+        with patch.object(adapter, "get_pr_head_sha", return_value="abc123"), \
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
+             patch("app.adapters.vcs.github_cli_adapter.time.sleep") as mock_sleep:
+            mock_run.side_effect = [
+                _err("gh: Server Error (HTTP 502)"),
+                _ok(json.dumps({"id": 99, "html_url": "https://x"})),
+            ]
+            result = adapter.create_review(
+                "acme/repo", 1, "body", "REQUEST_CHANGES",
+                [{"path": "f.py", "line": 1, "body": "x"}],
+            )
+        assert result["id"] == 99
+        assert mock_run.call_count == 2
+        assert mock_sleep.call_count == 1  # one backoff between attempts
+
+    def test_retries_on_503_and_504(self, adapter):
+        """503 Service Unavailable and 504 Gateway Timeout are also retried."""
+        with patch.object(adapter, "get_pr_head_sha", return_value="abc"), \
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
+             patch("app.adapters.vcs.github_cli_adapter.time.sleep"):
+            mock_run.side_effect = [
+                _err("gh: HTTP 503"),
+                _err("gh: HTTP 504"),
+                _ok(json.dumps({"id": 1})),
+            ]
+            result = adapter.create_review("acme/repo", 1, "b", "COMMENT", [])
+        assert result["id"] == 1
+        assert mock_run.call_count == 3
+
+    def test_gives_up_after_all_retries_exhausted(self, adapter):
+        """4 total attempts (1 initial + 3 retries) on persistent 502."""
+        with patch.object(adapter, "get_pr_head_sha", return_value="abc"), \
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
+             patch("app.adapters.vcs.github_cli_adapter.time.sleep"):
+            mock_run.return_value = _err("gh: Server Error (HTTP 502)")
+            with pytest.raises(VCSError, match="502"):
+                adapter.create_review("acme/repo", 1, "b", "COMMENT", [])
+        # 1 initial + 3 retry delays = 4 attempts total
+        assert mock_run.call_count == 4
+
+    def test_does_not_retry_on_422(self, adapter):
+        """422 isn't transient — fold-and-retry path handles it once, no
+        exponential backoff loop."""
+        with patch.object(adapter, "get_pr_head_sha", return_value="abc"), \
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
+             patch("app.adapters.vcs.github_cli_adapter.time.sleep") as mock_sleep:
+            mock_run.return_value = _err("gh: HTTP 422")
+            with pytest.raises(VCSError, match="422"):
+                adapter.create_review("acme/repo", 1, "b", "COMMENT", [])
+        # No comments → no fallback → just the initial attempt
+        assert mock_run.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    def test_does_not_retry_on_404(self, adapter):
+        """404 is a real error — don't waste retries."""
+        with patch.object(adapter, "get_pr_head_sha", return_value="abc"), \
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
+             patch("app.adapters.vcs.github_cli_adapter.time.sleep") as mock_sleep:
+            mock_run.return_value = _err("gh: Not Found (HTTP 404)")
+            with pytest.raises(VCSError, match="404"):
+                adapter.create_review("acme/repo", 1, "b", "COMMENT", [])
+        assert mock_run.call_count == 1
+        assert mock_sleep.call_count == 0
 
     def test_fold_comments_preserves_path_and_line(self):
         body = "Top body"

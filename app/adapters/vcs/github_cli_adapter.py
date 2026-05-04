@@ -1,5 +1,6 @@
 """GitHub CLI implementation of VCSPort."""
 import json
+import logging
 import re
 import subprocess
 import time
@@ -8,6 +9,8 @@ from app.adapters._subprocess import SubprocessError, clean_env, run_subprocess
 from app.domain.exceptions import VCSError
 from app.domain.models import PR
 from app.ports.vcs_port import VCSPort
+
+logger = logging.getLogger(__name__)
 
 # Transient HTTP statuses where retrying with backoff is safe and effective.
 # 408 = Request Timeout, 425 = Too Early, 429 = Rate Limited (best-effort),
@@ -212,28 +215,47 @@ class GitHubCLIAdapter(VCSPort):
         )
         if result.returncode == 0:
             return json.loads(result.stdout)
+        logger.warning(
+            "create_review | initial attempt failed | repo=%s pr=#%d stderr=%s",
+            repo_full_name, pr_number, result.stderr.strip(),
+        )
 
         # 422 most often means at least one inline comment references a line
-        # that isn't in the PR diff (line outside hunk, file is shorter on
-        # head SHA, or AI hallucinated the line number). The reviews endpoint
-        # is all-or-nothing — one bad comment fails the whole batch — so we
-        # fall back to a body-only review with the findings inlined into the
-        # body so the user still gets a REQUEST_CHANGES banner with no data
-        # loss.
+        # that isn't in the PR diff. The reviews endpoint is all-or-nothing,
+        # so we fold the findings into the body and retry without comments.
+        body_for_fallback = body
+        last_stderr = result.stderr
         if "422" in result.stderr and comments:
-            fallback_body = self._fold_comments_into_body(body, comments)
+            body_for_fallback = self._fold_comments_into_body(body, comments)
             retry = self._post_review_with_retry(
-                repo_full_name, pr_number, fallback_body, event, [], commit_id,
+                repo_full_name, pr_number, body_for_fallback, event, [], commit_id,
             )
             if retry.returncode == 0:
                 parsed = json.loads(retry.stdout)
-                parsed["_fallback_applied"] = True
+                parsed["_fallback_applied"] = "comments_folded_into_body"
                 return parsed
-            raise VCSError(
-                f"Failed to create review (fallback also failed): {retry.stderr.strip()}"
+            logger.warning(
+                "create_review | fold-comments fallback failed | repo=%s pr=#%d stderr=%s",
+                repo_full_name, pr_number, retry.stderr.strip(),
             )
+            last_stderr = retry.stderr
 
-        raise VCSError(f"Failed to create review: {result.stderr.strip()}")
+        # Persistent 422: GitHub is rejecting the review itself, not the
+        # inline comments. Common causes: reviewing your own PR (you can
+        # only COMMENT, not REQUEST_CHANGES on a PR you authored), or the
+        # PR is closed. Fall back to a regular issue comment with the body
+        # so the user's findings still land on the PR — but mark the result
+        # so the caller can warn the user that the review state was lost.
+        if "422" in last_stderr:
+            comment_url = self.post_comment(repo_full_name, pr_number, body_for_fallback)
+            return {
+                "_fallback_applied": "posted_as_comment",
+                "_fallback_reason": last_stderr.strip(),
+                "html_url": comment_url,
+                "id": None,
+            }
+
+        raise VCSError(f"Failed to create review: {last_stderr.strip()}")
 
     def _post_review_with_retry(
         self,

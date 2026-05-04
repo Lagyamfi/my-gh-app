@@ -544,6 +544,20 @@ def publish_inline_comment(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+_FALLBACK_WARNINGS = {
+    "comments_folded_into_body": (
+        "GitHub rejected one or more inline comments (line outside the PR "
+        "diff). The review was published with the findings folded into the "
+        "review body instead."
+    ),
+    "posted_as_comment": (
+        "GitHub refused to create a review (you may be the PR's author, or "
+        "the PR is closed). Posted the findings as a regular PR comment "
+        "instead — the 'Changes requested' banner won't appear."
+    ),
+}
+
+
 @app.post("/api/review/publish")
 def publish_review(data: PublishReview, svc: CommentService = Depends(get_comment_service)):
     try:
@@ -555,12 +569,11 @@ def publish_review(data: PublishReview, svc: CommentService = Depends(get_commen
             [c.model_dump() for c in data.comments],
         )
         response = {"status": "published", "url": result.get("html_url"), "id": result.get("id")}
-        if result.get("_fallback_applied"):
-            response["warning"] = (
-                "GitHub rejected one or more inline comments (line outside the PR "
-                "diff). The review was published with the findings folded into the "
-                "review body instead."
-            )
+        fallback = result.get("_fallback_applied")
+        if fallback in _FALLBACK_WARNINGS:
+            response["warning"] = _FALLBACK_WARNINGS[fallback]
+            if result.get("_fallback_reason"):
+                response["detail"] = result["_fallback_reason"]
         return response
     except Exception as e:
         logger.exception("publish_review | failed | repo=%s pr=#%d", data.repo, data.pr_number)

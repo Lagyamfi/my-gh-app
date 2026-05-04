@@ -56,7 +56,7 @@ class TestCreateReview:
             ]
             result = adapter.create_review("acme/repo", 1, "Please address", "REQUEST_CHANGES", comments)
         assert result["id"] == 7
-        assert result["_fallback_applied"] is True
+        assert result["_fallback_applied"] == "comments_folded_into_body"
         assert mock_run.call_count == 2
         # Second call's payload should have empty comments and folded body
         retry_payload = json.loads(mock_run.call_args_list[1].kwargs["input"])
@@ -65,14 +65,40 @@ class TestCreateReview:
         assert "app/bar.py:5" in retry_payload["body"]
         assert "Please address" in retry_payload["body"]
 
-    def test_does_not_retry_when_no_comments_to_drop(self, adapter):
-        """If there are no inline comments, a 422 is a real failure — don't loop."""
+    def test_falls_back_to_pr_comment_when_review_persistently_422s(self, adapter):
+        """When GitHub keeps refusing the review (e.g. self-review), fall back
+        to posting the body as a regular PR comment so findings aren't lost."""
         with patch.object(adapter, "get_pr_head_sha", return_value="abc123"), \
+             patch.object(adapter, "post_comment", return_value="https://github.com/x#issuecomment-1") as mock_post, \
              patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = _err("gh: Unprocessable Entity (HTTP 422)")
-            with pytest.raises(VCSError, match="422"):
-                adapter.create_review("acme/repo", 1, "body", "REQUEST_CHANGES", [])
-        assert mock_run.call_count == 1
+            mock_run.return_value = _err(
+                "gh: Validation Failed (HTTP 422)\n"
+                '{"message":"Can not request changes on your own pull request"}'
+            )
+            result = adapter.create_review("acme/repo", 1, "Issue", "REQUEST_CHANGES", [])
+        assert result["_fallback_applied"] == "posted_as_comment"
+        assert "Can not request changes" in result["_fallback_reason"]
+        assert result["html_url"] == "https://github.com/x#issuecomment-1"
+        assert result["id"] is None
+        mock_post.assert_called_once_with("acme/repo", 1, "Issue")
+
+    def test_pr_comment_fallback_uses_folded_body(self, adapter):
+        """When inline comments AND the review itself both 422, the comment
+        fallback should use the folded body (not the original)."""
+        comments = [{"path": "f.py", "line": 1, "body": "issue"}]
+        with patch.object(adapter, "get_pr_head_sha", return_value="abc123"), \
+             patch.object(adapter, "post_comment", return_value="https://x") as mock_post, \
+             patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                _err("gh: HTTP 422"),
+                _err("gh: HTTP 422"),
+            ]
+            result = adapter.create_review("acme/repo", 1, "Top", "REQUEST_CHANGES", comments)
+        assert result["_fallback_applied"] == "posted_as_comment"
+        # Body passed to post_comment should be the folded version
+        posted_body = mock_post.call_args[0][2]
+        assert "f.py:1" in posted_body
+        assert "Top" in posted_body
 
     def test_raises_on_non_retryable_non_422_error(self, adapter):
         """Permanent errors like 403 should NOT trigger fallback or retry."""
@@ -133,16 +159,18 @@ class TestCreateReview:
         # 1 initial + 3 retry delays = 4 attempts total
         assert mock_run.call_count == 4
 
-    def test_does_not_retry_on_422(self, adapter):
-        """422 isn't transient — fold-and-retry path handles it once, no
-        exponential backoff loop."""
+    def test_does_not_exponentially_retry_on_422(self, adapter):
+        """422 isn't transient — there's no exponential backoff loop.
+        With no comments, fold-fallback is skipped → goes straight to
+        the comment fallback (one extra call to post_comment)."""
         with patch.object(adapter, "get_pr_head_sha", return_value="abc"), \
+             patch.object(adapter, "post_comment", return_value="https://x"), \
              patch("app.adapters.vcs.github_cli_adapter.subprocess.run") as mock_run, \
              patch("app.adapters.vcs.github_cli_adapter.time.sleep") as mock_sleep:
             mock_run.return_value = _err("gh: HTTP 422")
-            with pytest.raises(VCSError, match="422"):
-                adapter.create_review("acme/repo", 1, "b", "COMMENT", [])
-        # No comments → no fallback → just the initial attempt
+            result = adapter.create_review("acme/repo", 1, "b", "COMMENT", [])
+        assert result["_fallback_applied"] == "posted_as_comment"
+        # Only the initial reviews POST — no exponential retries
         assert mock_run.call_count == 1
         assert mock_sleep.call_count == 0
 

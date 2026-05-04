@@ -77,3 +77,19 @@ class TestAnalyzeComments:
         ai_provider.analyze_comments = AsyncMock(return_value=[])
         result = await service.analyze_comments("acme/backend", 1)
         assert result["analysis"] == []
+
+
+class TestCreateReview:
+    def test_delegates_to_vcs_with_request_changes(self, service, vcs_port):
+        vcs_port.create_review.return_value = {"id": 42, "html_url": "https://github.com/acme/backend/pull/1#review-42"}
+        comments = [{"path": "app/foo.py", "line": 10, "body": "Issue here"}]
+        result = service.create_review("acme/backend", 1, "Please address", "REQUEST_CHANGES", comments)
+        vcs_port.create_review.assert_called_once_with(
+            "acme/backend", 1, "Please address", "REQUEST_CHANGES", comments
+        )
+        assert result["id"] == 42
+
+    def test_passes_event_through(self, service, vcs_port):
+        vcs_port.create_review.return_value = {"id": 1}
+        service.create_review("acme/backend", 2, "Looks good", "APPROVE", [])
+        assert vcs_port.create_review.call_args[0][3] == "APPROVE"

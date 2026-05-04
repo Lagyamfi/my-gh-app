@@ -184,3 +184,40 @@ class GitHubCLIAdapter(VCSPort):
         else:
             path = f"repos/{repo_full_name}/issues/comments/{comment_id}"
         self._run(["api", path, "--method", "DELETE"])
+
+    def create_review(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[dict],
+        commit_id: str | None = None,
+    ) -> dict:
+        if event not in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
+            raise VCSError(f"invalid review event {event!r}")
+        if commit_id is None:
+            commit_id = self.get_pr_head_sha(repo_full_name, pr_number)
+
+        payload = json.dumps({
+            "commit_id": commit_id,
+            "body": body,
+            "event": event,
+            "comments": [
+                {"path": c["path"], "line": c["line"], "body": c["body"], "side": "RIGHT"}
+                for c in comments
+            ],
+        })
+
+        try:
+            result = subprocess.run(
+                ["gh", "api", f"repos/{repo_full_name}/pulls/{pr_number}/reviews",
+                 "--method", "POST", "--input", "-"],
+                input=payload, capture_output=True, text=True, timeout=60, env=clean_env(),
+            )
+        except subprocess.TimeoutExpired as e:
+            raise VCSError("create_review timed out after 60s") from e
+
+        if result.returncode != 0:
+            raise VCSError(f"Failed to create review: {result.stderr.strip()}")
+        return json.loads(result.stdout)

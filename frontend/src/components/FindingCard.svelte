@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Finding, Repo, PR } from '../lib/types';
-  import { publishFinding } from '../stores/prs';
+  import { publishFinding, stageFinding, unstageFinding, stagedReviewFindings } from '../stores/prs';
   import { showToast } from '../stores/ui';
 
   let { finding, repo, pr, index = 0 }: { finding: Finding; repo: Repo; pr: PR; index?: number } = $props();
@@ -8,22 +8,46 @@
   let publishing = $state(false);
   let published = $state(false);
 
+  let isStaged = $derived(
+    $stagedReviewFindings.some(
+      (f) =>
+        f.title === finding.title &&
+        f.priority === finding.priority &&
+        f.file === finding.file &&
+        f.line === finding.line,
+    ),
+  );
+
   async function handlePublish() {
     publishing = true;
     try {
       await publishFinding(repo.owner, repo.name, pr.number, finding);
       published = true;
-      showToast('Published to PR', 'success');
+      const msg = finding.priority === 'P1'
+        ? 'Published as Request Changes review'
+        : 'Published to PR';
+      showToast(msg, 'success');
     } catch {
       showToast('Failed to publish', 'error');
     } finally {
       publishing = false;
     }
   }
+
+  function handleAddToReview() {
+    if (isStaged) {
+      unstageFinding(finding);
+      showToast('Removed from review', 'info');
+    } else {
+      stageFinding(finding);
+      showToast('Added to review', 'success');
+    }
+  }
 </script>
 
 <div
   class="finding finding-{finding.priority.toLowerCase()}"
+  class:staged={isStaged}
   style="animation-delay: {index * 60}ms"
 >
   <div class="finding-header">
@@ -32,13 +56,23 @@
     {#if finding.file}
       <span class="file-ref">{finding.file}{finding.line ? `:${finding.line}` : ''}</span>
     {/if}
-    <button
-      class="btn btn-sm {published ? 'btn-success' : 'btn-accent'} publish-btn"
-      onclick={handlePublish}
-      disabled={publishing || published}
-    >
-      {publishing ? '…' : published ? '✓ Published' : '↗ Publish'}
-    </button>
+    <div class="actions">
+      <button
+        class="btn btn-sm {isStaged ? 'btn-staged' : 'btn-ghost'}"
+        onclick={handleAddToReview}
+        title={isStaged ? 'Remove from pending review' : 'Stage for batch review'}
+      >
+        {isStaged ? '✓ In review' : '+ Add to review'}
+      </button>
+      <button
+        class="btn btn-sm {published ? 'btn-success' : finding.priority === 'P1' ? 'btn-warn' : 'btn-accent'}"
+        onclick={handlePublish}
+        disabled={publishing || published}
+        title={finding.priority === 'P1' ? 'Publish as Request Changes review' : 'Publish as comment'}
+      >
+        {publishing ? '…' : published ? '✓ Published' : finding.priority === 'P1' ? '⚠ Request changes' : '↗ Publish'}
+      </button>
+    </div>
   </div>
 
   <p class="finding-desc">{finding.description}</p>
@@ -63,6 +97,10 @@
     animation: fadeSlide 0.3s ease both;
     transition: border-color var(--transition-base), box-shadow var(--transition-base);
   }
+  .finding.staged {
+    border-color: rgba(150, 110, 240, 0.55);
+    background: rgba(120, 80, 220, 0.06);
+  }
   .finding::before {
     content: '';
     position: absolute;
@@ -80,7 +118,30 @@
   .finding-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
   .finding-title { font-size: 12px; font-weight: 600; color: var(--text-primary); flex: 1; min-width: 0; }
   .file-ref { font-size: 10px; color: var(--text-muted); font-style: italic; white-space: nowrap; }
-  .publish-btn { margin-left: auto; flex-shrink: 0; }
+  .actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    color: var(--text-secondary);
+  }
+  .btn-ghost:hover {
+    border-color: rgba(150, 110, 240, 0.55);
+    background: rgba(120, 80, 220, 0.08);
+    color: var(--text-primary);
+  }
+  .btn-staged {
+    background: rgba(120, 80, 220, 0.18);
+    border: 1px solid rgba(150, 110, 240, 0.55);
+    color: rgb(190, 160, 255);
+  }
+  .btn-warn {
+    background: rgba(255, 140, 66, 0.16);
+    border: 1px solid rgba(255, 140, 66, 0.45);
+    color: rgb(255, 175, 110);
+  }
+  .btn-warn:hover:not(:disabled) {
+    background: rgba(255, 140, 66, 0.25);
+  }
   .finding-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.6; margin: 0; }
   .suggestion { margin-top: 10px; }
   .suggestion summary { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; user-select: none; }

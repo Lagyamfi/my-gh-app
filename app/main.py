@@ -218,6 +218,20 @@ class PublishInlineComment(BaseModel):
     line: int
 
 
+class ReviewCommentItem(BaseModel):
+    path: str
+    line: int
+    body: str
+
+
+class PublishReview(BaseModel):
+    repo: str
+    pr_number: int
+    body: str
+    event: str = "REQUEST_CHANGES"  # REQUEST_CHANGES | APPROVE | COMMENT
+    comments: list[ReviewCommentItem] = []
+
+
 class ImplementFix(BaseModel):
     repo: str
     pr_number: int
@@ -527,6 +541,22 @@ def publish_inline_comment(
         return {"status": "published"}
     except Exception as e:
         logger.exception("publish_inline_comment | failed | repo=%s pr=#%d", data.repo, data.pr_number)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/review/publish")
+def publish_review(data: PublishReview, svc: CommentService = Depends(get_comment_service)):
+    try:
+        result = svc.create_review(
+            data.repo,
+            data.pr_number,
+            data.body,
+            data.event,
+            [c.model_dump() for c in data.comments],
+        )
+        return {"status": "published", "url": result.get("html_url"), "id": result.get("id")}
+    except Exception as e:
+        logger.exception("publish_review | failed | repo=%s pr=#%d", data.repo, data.pr_number)
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -71,3 +71,20 @@ class VCSPort(ABC):
     def delete_comment(self, repo_full_name: str, comment_id: int, comment_type: str) -> None:
         """Delete a comment by ID. comment_type: 'pr_comment' | 'review_comment'."""
         ...
+
+    @abstractmethod
+    def create_review(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[dict],
+        commit_id: str | None = None,
+    ) -> dict:
+        """Create a PR review (APPROVE / REQUEST_CHANGES / COMMENT) with optional inline comments.
+
+        Each comment in ``comments`` is ``{"path": str, "line": int, "body": str}``.
+        ``event`` is one of GitHub's review events: ``APPROVE``, ``REQUEST_CHANGES``, ``COMMENT``.
+        """
+        ...

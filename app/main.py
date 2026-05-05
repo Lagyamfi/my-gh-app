@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import shutil
+from collections.abc import AsyncGenerator
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +20,15 @@ from app.adapters.cache.json_file_cache import JsonFileCache
 from app.adapters.vcs.github_cli_adapter import GitHubCLIAdapter
 from app.adapters.worktree.git_worktree_adapter import GitWorktreeAdapter
 from app.domain.exceptions import WorktreeNoChangesError, WorktreeNotFoundError
-from app.ports.ai_provider import AIProvider, ReviewChunkEvent, ReviewResultEvent, ReviewWarningEvent
+from app.domain.models import Comment
+from app.ports.ai_provider import (
+    AIProvider,
+    FixChunkEvent,
+    ReviewChunkEvent,
+    ReviewResultEvent,
+    ReviewStreamEvent,
+    ReviewWarningEvent,
+)
 from app.services.comment_service import CommentService
 from app.services.fix_service import FixService
 from app.services.review_service import ReviewService
@@ -28,9 +38,20 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="gh-review-tool")
 
-# --- Dependency injection ---
+# --- Provider registry & availability ---
 
-_SUPPORTED_PROVIDERS = ("opencode", "claude-code")
+# CLI binary expected on PATH for each provider, in display order.
+_PROVIDER_CLIS: dict[str, str] = {
+    "opencode": "opencode",
+    "claude-code": "claude",
+}
+_SUPPORTED_PROVIDERS: tuple[str, ...] = tuple(_PROVIDER_CLIS.keys())
+
+
+def _provider_available(name: str) -> bool:
+    """True if the provider's CLI binary is on PATH."""
+    cli = _PROVIDER_CLIS.get(name)
+    return cli is not None and shutil.which(cli) is not None
 
 
 def _build_ai_provider(name: str) -> AIProvider:
@@ -44,13 +65,110 @@ def _build_ai_provider(name: str) -> AIProvider:
     )
 
 
-_ai_provider_name = os.environ.get("AI_PROVIDER", "opencode").strip().lower()
+class SwitchableAIProvider(AIProvider):
+    """Delegates to one of several AI provider adapters, chosen at runtime.
+
+    The active provider can be changed via :meth:`set_active` without
+    rebuilding the services that hold a reference to this wrapper.
+    """
+
+    def __init__(self, providers: dict[str, AIProvider], active: str) -> None:
+        if active not in providers:
+            raise ValueError(f"Unknown active provider {active!r}")
+        self._providers = providers
+        self._active = active
+
+    @property
+    def active(self) -> str:
+        return self._active
+
+    def set_active(self, name: str) -> None:
+        if name not in self._providers:
+            raise ValueError(
+                f"Unknown provider {name!r}. Supported: {', '.join(self._providers)}"
+            )
+        self._active = name
+
+    def _delegate(self) -> AIProvider:
+        return self._providers[self._active]
+
+    async def stream_review(
+        self, repo_full_name: str, pr_number: int, diff: str, model: str | None = None
+    ) -> AsyncGenerator[ReviewStreamEvent, None]:
+        async for event in self._delegate().stream_review(
+            repo_full_name, pr_number, diff, model=model
+        ):
+            yield event
+
+    async def analyze_comments(
+        self, repo_full_name: str, pr_number: int, comments: list[Comment]
+    ) -> list[dict]:
+        return await self._delegate().analyze_comments(repo_full_name, pr_number, comments)
+
+    async def stream_fix(
+        self, repo_dir: str, repo_full_name: str, pr_number: int, comment_body: str
+    ) -> AsyncGenerator[FixChunkEvent, None]:
+        async for chunk in self._delegate().stream_fix(
+            repo_dir, repo_full_name, pr_number, comment_body
+        ):
+            yield chunk
+
+    async def generate_text(self, prompt: str, timeout: int = 60) -> str:
+        return await self._delegate().generate_text(prompt, timeout=timeout)
+
+
+def _resolve_initial_provider() -> tuple[str, bool]:
+    """Pick the initial active provider.
+
+    Returns ``(name, from_env)``. Resolution order:
+
+    1. ``AI_PROVIDER`` env var if set and supported (warn if its CLI is missing).
+    2. First provider whose CLI is on PATH.
+    3. ``opencode`` as last-resort fallback (so the app still boots and the
+       user can pick a provider from the UI).
+    """
+    raw = os.environ.get("AI_PROVIDER", "").strip().lower()
+    if raw:
+        if raw not in _SUPPORTED_PROVIDERS:
+            logger.warning(
+                "AI_PROVIDER=%r is not supported (expected one of %s); falling back to auto-detect.",
+                raw, ", ".join(_SUPPORTED_PROVIDERS),
+            )
+        else:
+            if not _provider_available(raw):
+                logger.warning(
+                    "AI_PROVIDER=%r is set, but the %r CLI is not on PATH. "
+                    "Reviews will fail until you install it or switch providers via the UI.",
+                    raw, _PROVIDER_CLIS[raw],
+                )
+            return raw, True
+
+    for name in _SUPPORTED_PROVIDERS:
+        if _provider_available(name):
+            return name, False
+
+    logger.warning(
+        "No supported AI provider CLI found on PATH (looked for %s). "
+        "The server will boot but reviews will fail until a CLI is installed.",
+        ", ".join(_PROVIDER_CLIS.values()),
+    )
+    return _SUPPORTED_PROVIDERS[0], False
+
+
+_initial_provider, _provider_from_env = _resolve_initial_provider()
 
 _cache = JsonFileCache()
 _vcs = GitHubCLIAdapter()
-_ai = _build_ai_provider(_ai_provider_name)
 _worktree = GitWorktreeAdapter()
-logger.info("AI provider | %s", _ai_provider_name)
+_ai = SwitchableAIProvider(
+    providers={name: _build_ai_provider(name) for name in _SUPPORTED_PROVIDERS},
+    active=_initial_provider,
+)
+logger.info(
+    "AI provider | active=%s | from_env=%s | available=%s",
+    _ai.active, _provider_from_env,
+    {name: _provider_available(name) for name in _SUPPORTED_PROVIDERS},
+)
 
 _review_service = ReviewService(ai=_ai, cache=_cache, vcs=_vcs)
 _fix_service = FixService(ai=_ai, vcs=_vcs, worktree=_worktree)
@@ -100,6 +218,20 @@ class PublishInlineComment(BaseModel):
     line: int
 
 
+class ReviewCommentItem(BaseModel):
+    path: str
+    line: int
+    body: str
+
+
+class PublishReview(BaseModel):
+    repo: str
+    pr_number: int
+    body: str
+    event: str = "REQUEST_CHANGES"  # REQUEST_CHANGES | APPROVE | COMMENT
+    comments: list[ReviewCommentItem] = []
+
+
 class ImplementFix(BaseModel):
     repo: str
     pr_number: int
@@ -141,31 +273,88 @@ def search_repos(org: str, q: str = ""):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Config endpoint ---
+# --- Config & provider endpoints ---
+
+
+def _provider_status() -> dict:
+    """Snapshot of provider availability + active selection."""
+    return {
+        "active": _ai.active,
+        "from_env": _provider_from_env,
+        "supported": list(_SUPPORTED_PROVIDERS),
+        "available": {name: _provider_available(name) for name in _SUPPORTED_PROVIDERS},
+        "clis": dict(_PROVIDER_CLIS),
+    }
+
 
 @app.get("/api/config")
 def get_config():
-    """Return static runtime configuration consumed by the frontend."""
+    """Return static runtime configuration consumed by the frontend.
+
+    Includes ``ai_provider`` for backwards compatibility with older frontend
+    builds; new frontends should prefer ``GET /api/providers``.
+    """
+    status = _provider_status()
     return {
-        "ai_provider": _ai_provider_name,
-        "supported_providers": list(_SUPPORTED_PROVIDERS),
+        "ai_provider": status["active"],
+        "supported_providers": status["supported"],
+        "providers": status,
     }
+
+
+@app.get("/api/providers")
+def get_providers():
+    """Return active provider, env-var origin, and per-provider availability."""
+    return _provider_status()
+
+
+class ProviderSelect(BaseModel):
+    name: str
+
+
+@app.post("/api/provider")
+def set_provider(data: ProviderSelect):
+    """Switch the active AI provider at runtime.
+
+    Returns 400 if ``name`` isn't a supported provider, and warns (via the
+    response body) if the provider's CLI is not on PATH — the call still
+    succeeds so the user can install the CLI without restarting.
+    """
+    name = data.name.strip().lower()
+    if name not in _SUPPORTED_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider {name!r}. Supported: {', '.join(_SUPPORTED_PROVIDERS)}",
+        )
+    _ai.set_active(name)
+    available = _provider_available(name)
+    if not available:
+        logger.warning(
+            "Switched active provider to %r but %r CLI is missing on PATH.",
+            name, _PROVIDER_CLIS[name],
+        )
+    else:
+        logger.info("AI provider switched | active=%s", name)
+    return {**_provider_status(), "warning": None if available else (
+        f"Provider {name!r} selected, but its CLI ({_PROVIDER_CLIS[name]!r}) is not on PATH."
+    )}
 
 
 @app.get("/api/models")
 def list_models():
     """Return all models available in the active AI provider's installation."""
     import subprocess
-    if _ai_provider_name == "opencode":
+    active = _ai.active
+    if active == "opencode":
         cmd = ["opencode", "models"]
-    elif _ai_provider_name == "claude-code":
-        # Claude Code does not expose a `models` listing command, and pinned
-        # version names (e.g. 'claude-opus-4-7') are rejected by older CLI
-        # installs or accounts without access to that exact version. Aliases
-        # always resolve to the latest model the user's CLI supports.
-        return {"models": ["opus", "sonnet", "haiku"]}
+    elif active == "claude-code":
+        from app.adapters.ai.claude_code_adapter import list_models as _claude_list_models
+        return {"models": _claude_list_models()}
     else:
-        raise HTTPException(status_code=500, detail=f"Unknown provider {_ai_provider_name!r}")
+        raise HTTPException(status_code=500, detail=f"Unknown provider {active!r}")
+
+    if not _provider_available(active):
+        return {"models": [], "warning": f"{_PROVIDER_CLIS[active]!r} CLI not found on PATH."}
 
     try:
         result = subprocess.run(
@@ -318,7 +507,10 @@ async def stream_review(
             yield 'data: {"type": "done"}\n\n'
         except Exception as e:
             logger.exception("stream_review | failed | repo=%s/%s pr=#%d", owner, repo, pr_number)
-            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+            # Field name is `message` to match the frontend's SSEReviewEvent
+            # contract — `text` was a regression that left the UI showing an
+            # empty error box.
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             yield 'data: {"type": "done"}\n\n'
 
     return StreamingResponse(
@@ -349,6 +541,42 @@ def publish_inline_comment(
         return {"status": "published"}
     except Exception as e:
         logger.exception("publish_inline_comment | failed | repo=%s pr=#%d", data.repo, data.pr_number)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_FALLBACK_WARNINGS = {
+    "comments_folded_into_body": (
+        "GitHub rejected one or more inline comments (line outside the PR "
+        "diff). The review was published with the findings folded into the "
+        "review body instead."
+    ),
+    "posted_as_comment": (
+        "GitHub refused to create a review (you may be the PR's author, or "
+        "the PR is closed). Posted the findings as a regular PR comment "
+        "instead — the 'Changes requested' banner won't appear."
+    ),
+}
+
+
+@app.post("/api/review/publish")
+def publish_review(data: PublishReview, svc: CommentService = Depends(get_comment_service)):
+    try:
+        result = svc.create_review(
+            data.repo,
+            data.pr_number,
+            data.body,
+            data.event,
+            [c.model_dump() for c in data.comments],
+        )
+        response = {"status": "published", "url": result.get("html_url"), "id": result.get("id")}
+        fallback = result.get("_fallback_applied")
+        if fallback in _FALLBACK_WARNINGS:
+            response["warning"] = _FALLBACK_WARNINGS[fallback]
+            if result.get("_fallback_reason"):
+                response["detail"] = result["_fallback_reason"]
+        return response
+    except Exception as e:
+        logger.exception("publish_review | failed | repo=%s pr=#%d", data.repo, data.pr_number)
         raise HTTPException(status_code=500, detail=str(e))
 
 

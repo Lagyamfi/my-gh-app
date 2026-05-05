@@ -7,6 +7,7 @@ AI_PROVIDER environment variable (see app.main).
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator
 
@@ -45,6 +46,32 @@ You are currently in the repository checkout on the PR branch.
 Read the relevant files, understand the issue, and EDIT the files to implement the fix.
 Make minimal, targeted changes. Do NOT create new files unless absolutely necessary.
 Do NOT run tests or build commands — just make the code changes."""
+
+# Parses Claude Code's "Try --model to switch to <id>" suggestion from error output.
+_SUGGESTION_RE = re.compile(r"--model to switch to ([\w.:/-]+)")
+
+
+def list_models() -> list[str]:
+    """Return the model names accepted by the installed claude CLI.
+
+    Returns the three universal aliases — opus, sonnet, haiku — which Claude
+    Code maps to the appropriate backend-specific model ID automatically,
+    regardless of whether the backend is the Anthropic API, AWS Bedrock
+    (any region), Vertex AI, etc.
+
+    Versioned IDs such as "claude-sonnet-4-6" are NOT returned because they
+    are Anthropic-API-specific and break on Bedrock/Vertex deployments where
+    the equivalent ID has a different format (e.g. the Bedrock EU inference
+    profile "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"). Users who need
+    a specific pinned ID can enter it via the UI's free-form custom input.
+    """
+    return ["opus", "sonnet", "haiku"]
+
+
+def parse_model_suggestion(text: str) -> str | None:
+    """Extract a model ID from a Claude Code 'Try --model to switch to X' hint."""
+    m = _SUGGESTION_RE.search(text)
+    return m.group(1).rstrip(".") if m else None
 
 
 def _parse_review_output(output: str) -> Review:
@@ -91,8 +118,9 @@ async def _stream_claude_code(
     """Stream raw claude (Claude Code) output line by line.
 
     Uses `claude -p` (print/non-interactive mode) which prints to stdout and exits.
-    The prompt is sent on stdin when long, otherwise as a positional argument —
-    matching the OpenCode adapter's approach so behavior stays comparable.
+    Always passes the prompt as a positional argument — claude's `-p` mode does not
+    reliably consume stdin in some installs. Linux ARG_MAX is ~2 MB so even large
+    review prompts fit comfortably.
     """
     prompt = message
     if context:
@@ -107,38 +135,27 @@ async def _stream_claude_code(
 
     extra_args: list[str] = ["-p", "--output-format", "text"]
     if model:
-        # The Claude Code CLI accepts aliases ('sonnet') or full names
-        # ('claude-sonnet-4-6'), but rejects OpenCode/OpenRouter-style
-        # 'provider/model' identifiers. Strip the provider prefix so a
-        # value like 'anthropic/claude-sonnet-4-6' still works.
+        # Strip optional provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
         cli_model = model.split("/", 1)[1] if "/" in model else model
         extra_args += ["--model", cli_model]
-    # The fix flow runs against a real worktree and needs to actually edit files
-    # without prompting for each tool call. Read-only flows (review, comment
-    # analysis, commit-message generation) don't need to bypass permissions.
     if allow_edits:
+        # Fix flow: keep CLAUDE.md auto-discovery, hooks, plugins so claude
+        # has project context while editing, and bypass per-tool prompts.
         extra_args += ["--dangerously-skip-permissions"]
-
-    if len(prompt) > 4000:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", *extra_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=clean_env(),
-        )
-        if proc.stdin is not None:
-            proc.stdin.write(prompt.encode())
-            proc.stdin.close()
     else:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", *extra_args, prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=clean_env(),
-        )
+        # Read-only flows (review, analyze comments, generate-text): use --bare
+        # so keychain reads, hooks, LSP, and CLAUDE.md auto-discovery are skipped.
+        # Without --bare, headless subprocess invocations fail the keychain-read
+        # step and fall back to a strict model-validation path.
+        extra_args += ["--bare"]
+
+    proc = await asyncio.create_subprocess_exec(
+        "claude", *extra_args, prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=clean_env(),
+    )
 
     if proc.stdout is None or proc.stderr is None:
         raise ProviderError("claude subprocess did not open stdout/stderr")
@@ -158,6 +175,7 @@ async def _stream_claude_code(
 
     stderr_task = asyncio.create_task(_read_stderr())
     output_lines = 0
+    stdout_capture: list[str] = []  # for surfacing as a warning when rc != 0
 
     while True:
         try:
@@ -172,6 +190,7 @@ async def _stream_claude_code(
             break
         decoded = line.decode()
         output_lines += 1
+        stdout_capture.append(decoded)
         logger.debug("claude-code | stdout | %s", decoded.rstrip())
         yield decoded
 
@@ -186,14 +205,39 @@ async def _stream_claude_code(
     stderr_lines = await stderr_task
 
     warning_lines = list(stderr_lines)
+    captured_stdout = "".join(stdout_capture).strip()
     if rc != 0:
         if output_lines == 0:
             warning_lines.insert(0, f"[claude exited with code {rc} and produced no output]")
         else:
             warning_lines.insert(0, f"[claude exited with code {rc}]")
+            if captured_stdout:
+                warning_lines.append("[claude stdout]")
+                snippet = captured_stdout[:4000]
+                for cap_line in snippet.splitlines()[:40]:
+                    warning_lines.append(cap_line)
 
     for err_line in warning_lines:
         yield f"\x00STDERR\x00{err_line}"
+
+    # Fail loud: a non-zero exit means claude couldn't produce a usable
+    # response. Raise so the SSE pipeline emits an `error` event and the UI
+    # shows it prominently instead of presenting a hollow "0 findings" review.
+    if rc != 0:
+        first_stdout_line = next(
+            (line for line in captured_stdout.splitlines() if line.strip()), ""
+        )
+        first_stderr_line = next(
+            (line for line in stderr_lines if line.strip()), ""
+        )
+        detail = first_stdout_line or first_stderr_line or "(no output)"
+        if len(detail) > 200:
+            detail = detail[:197] + "..."
+        logger.error(
+            "claude-code | failed | exit=%s | first_line=%r",
+            rc, detail,
+        )
+        raise ProviderError(f"claude exited with code {rc}: {detail}")
 
 
 class ClaudeCodeAdapter(AIProvider):

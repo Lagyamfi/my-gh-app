@@ -8,6 +8,8 @@ from app.adapters.ai.claude_code_adapter import (
     ClaudeCodeAdapter,
     _parse_review_output,
     _stream_claude_code,
+    list_models,
+    parse_model_suggestion,
 )
 from app.domain.exceptions import ProviderError
 from app.ports.ai_provider import (
@@ -51,6 +53,33 @@ class TestParseReviewOutput:
         review = _parse_review_output(raw)
         assert review.summary == "ok"
         assert review.findings == []
+
+
+class TestListModels:
+    def test_returns_three_universal_aliases(self):
+        assert list_models() == ["opus", "sonnet", "haiku"]
+
+    def test_does_not_contain_versioned_ids(self):
+        # Versioned IDs (e.g. "claude-sonnet-4-6") are backend-specific and
+        # break on Bedrock/Vertex deployments — only aliases are returned.
+        assert not any("-" in m for m in list_models())
+
+
+class TestParseModelSuggestion:
+    def test_parses_bedrock_eu_suggestion(self):
+        line = "API Error (claude-sonnet-4-6): 400 The provided model identifier is invalid.. Try --model to switch to eu.anthropic.claude-sonnet-4-5-20250929-v1:0."
+        assert parse_model_suggestion(line) == "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+    def test_parses_generic_switch_suggestion(self):
+        line = "Run --model to pick a different model."
+        assert parse_model_suggestion(line) is None
+
+    def test_returns_none_when_no_suggestion(self):
+        assert parse_model_suggestion("Authentication error") is None
+
+    def test_strips_trailing_period(self):
+        line = "Try --model to switch to us.anthropic.claude-opus-4-20250514-v1:0."
+        assert parse_model_suggestion(line) == "us.anthropic.claude-opus-4-20250514-v1:0"
 
 
 def _async_iter_strings(items):
@@ -183,11 +212,10 @@ async def test_stream_claude_code_strips_provider_prefix_from_model(monkeypatch)
     proc = _FakeProc([b'{"summary":"ok","findings":[]}\n'], [], 0)
     _patch_subprocess(monkeypatch, proc, captured)
 
-    chunks = []
-    async for chunk in _stream_claude_code(
+    async for _ in _stream_claude_code(
         "short prompt", model="anthropic/claude-sonnet-4-6"
     ):
-        chunks.append(chunk)
+        pass
 
     args = captured["args"]
     assert "--model" in args
@@ -207,17 +235,89 @@ async def test_stream_claude_code_passes_unprefixed_model_through(monkeypatch):
     assert args[args.index("--model") + 1] == "claude-opus-4-7"
 
 
-async def test_stream_claude_code_warns_on_nonzero_exit_with_output(monkeypatch):
+async def test_stream_claude_code_uses_bare_for_read_only_flows(monkeypatch):
+    """Review / analyze / generate-text invocations must include --bare so
+    Claude Code skips the keychain-read step that fails in headless subprocess
+    invocations."""
+    captured: dict = {}
+    proc = _FakeProc([b'{"summary":"ok","findings":[]}\n'], [], 0)
+    _patch_subprocess(monkeypatch, proc, captured)
+
+    async for _ in _stream_claude_code("hi"):
+        pass
+
+    args = captured["args"]
+    assert "--bare" in args, f"--bare must be passed for read-only flows, got {args!r}"
+    assert "--dangerously-skip-permissions" not in args
+
+
+async def test_stream_claude_code_omits_bare_for_fix_flow(monkeypatch):
+    """The fix flow needs CLAUDE.md / hooks / plugins for project context, so
+    --bare must NOT be passed; --dangerously-skip-permissions still is."""
+    captured: dict = {}
+    proc = _FakeProc([b"ok\n"], [], 0)
+    _patch_subprocess(monkeypatch, proc, captured)
+
+    async for _ in _stream_claude_code("hi", allow_edits=True):
+        pass
+
+    args = captured["args"]
+    assert "--bare" not in args, f"--bare must be absent for fix flow, got {args!r}"
+    assert "--dangerously-skip-permissions" in args
+
+
+async def test_stream_claude_code_warns_then_raises_on_nonzero_exit_with_output(monkeypatch):
+    """rc != 0 must yield warnings (so the UI's ⚠ panel can show them) AND
+    then raise ProviderError so the SSE pipeline emits a top-level `error`
+    event the user can see."""
+    from app.domain.exceptions import ProviderError
+
     captured: dict = {}
     error_msg = b"There's an issue with the selected model (foo). It may not exist...\n"
     proc = _FakeProc([error_msg], [], 1)
     _patch_subprocess(monkeypatch, proc, captured)
 
     chunks = []
-    async for chunk in _stream_claude_code("short prompt"):
-        chunks.append(chunk)
+    with pytest.raises(ProviderError, match="claude exited with code 1"):
+        async for chunk in _stream_claude_code("short prompt"):
+            chunks.append(chunk)
 
     stderr_chunks = [c for c in chunks if c.startswith("\x00STDERR\x00")]
     assert any("exited with code 1" in c for c in stderr_chunks), (
-        f"expected a non-zero-exit warning even when stdout had output, got {chunks!r}"
+        f"expected a non-zero-exit warning to be yielded before the raise, got {chunks!r}"
     )
+    # The captured stdout should also be promoted into the warning channel.
+    assert any("issue with the selected model" in c for c in stderr_chunks), (
+        f"expected stdout content to be surfaced as a warning, got {stderr_chunks!r}"
+    )
+
+
+async def test_stream_claude_code_raises_on_nonzero_exit_with_no_output(monkeypatch):
+    """rc != 0 with empty stdout still raises so the UI shows the failure."""
+    from app.domain.exceptions import ProviderError
+
+    captured: dict = {}
+    proc = _FakeProc([], [b"some stderr complaint\n"], 1)
+    _patch_subprocess(monkeypatch, proc, captured)
+
+    with pytest.raises(ProviderError, match="claude exited with code 1"):
+        async for _ in _stream_claude_code("short prompt"):
+            pass
+
+
+async def test_stream_claude_code_always_uses_positional_arg(monkeypatch):
+    """Large prompts must still be passed as a positional argument — claude's
+    `-p` mode does not reliably consume stdin, so we never use the stdin path."""
+    captured: dict = {}
+    proc = _FakeProc([b'{"summary":"ok","findings":[]}\n'], [], 0)
+    _patch_subprocess(monkeypatch, proc, captured)
+
+    big_prompt = "x" * 50_000  # well over the previous 4 KB stdin threshold
+    async for _ in _stream_claude_code(big_prompt):
+        pass
+
+    # The prompt should appear as the last positional argument.
+    args = captured["args"]
+    assert args[-1] == big_prompt
+    # And we should NOT have asked for a stdin pipe.
+    assert "stdin" not in captured["kwargs"]

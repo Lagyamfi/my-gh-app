@@ -3,8 +3,22 @@ import type { Toast, ToastType } from '../lib/types';
 
 export const toasts = writable<Toast[]>([]);
 
-/** Which AI provider is active (fetched once from /api/config). */
+/** Which AI provider is active (fetched from /api/providers, updatable at runtime). */
 export const aiProvider = writable<string>('');
+
+/** Status returned by GET /api/providers. */
+export interface ProvidersStatus {
+  active: string;
+  from_env: boolean;
+  supported: string[];
+  available: Record<string, boolean>;
+  clis: Record<string, string>;
+}
+
+export const providersStatus = writable<ProvidersStatus | null>(null);
+
+/** Whether the modal that lets the user pick a provider is open. */
+export const providerPickerOpen = writable<boolean>(false);
 
 const _LAST_MODEL_KEY_PREFIX = 'gh_review_last_model';
 

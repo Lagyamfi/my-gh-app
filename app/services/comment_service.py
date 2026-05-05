@@ -209,3 +209,14 @@ class CommentService:
         line: int,
     ) -> dict:
         return self._vcs.post_inline_comment(repo_full_name, pr_number, body, path, line)
+
+    def create_review(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[dict],
+    ) -> dict:
+        """Submit a PR review (REQUEST_CHANGES / APPROVE / COMMENT) with inline comments."""
+        return self._vcs.create_review(repo_full_name, pr_number, body, event, comments)

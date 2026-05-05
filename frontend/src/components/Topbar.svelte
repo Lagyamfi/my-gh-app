@@ -2,60 +2,180 @@
   import { onMount } from 'svelte';
   import { activeRepo } from '../stores/repos';
   import { activePR, activeTab } from '../stores/prs';
-  import { aiProvider, selectedModel, modelStorageKey, showToast } from '../stores/ui';
+  import {
+    aiProvider,
+    providersStatus,
+    providerPickerOpen,
+    selectedModel,
+    modelStorageKey,
+    showToast,
+    type ProvidersStatus,
+  } from '../stores/ui';
+
+  const PROVIDER_PICKED_KEY = 'gh_review_provider_picked';
 
   let availableModels = $state<string[]>([]);
   let currentProvider = $state<string>('');
 
-  onMount(async () => {
+  async function loadProviders(): Promise<ProvidersStatus | null> {
     try {
-      const [configRes, modelsRes] = await Promise.all([
-        fetch('/api/config'),
-        fetch('/api/models'),
-      ]);
-      if (configRes.ok) {
-        const data = await configRes.json();
-        currentProvider = data.ai_provider ?? '';
-        aiProvider.set(currentProvider);
-        if (currentProvider) showToast(`AI provider: ${currentProvider}`, 'info');
-      }
-      if (modelsRes.ok) {
-        const data = await modelsRes.json();
-        availableModels = data.models ?? [];
-      }
-      // Pick the active model from provider-scoped storage so a value cached
-      // for opencode (e.g. "anthropic/claude-sonnet-4-6") never leaks into a
-      // claude-code session and vice-versa.
-      //
-      // We never auto-pick availableModels[0]: opencode's `models` listing can
-      // include identifiers its runtime later rejects (e.g. an SDK upgrade
-      // that drops a previously-listed model). Falling back to "" sends no
-      // --model flag, so each provider uses its own default.
-      if (currentProvider) {
-        const stored = localStorage.getItem(modelStorageKey(currentProvider)) ?? '';
-        const valid = stored !== '' && availableModels.includes(stored);
-        selectedModel.set(valid ? stored : '');
-      }
+      const res = await fetch('/api/providers');
+      if (!res.ok) return null;
+      const status = (await res.json()) as ProvidersStatus;
+      providersStatus.set(status);
+      currentProvider = status.active;
+      aiProvider.set(currentProvider);
+      return status;
     } catch {
-      // silently ignore
+      return null;
+    }
+  }
+
+  async function loadModels(): Promise<void> {
+    try {
+      const res = await fetch('/api/models');
+      if (!res.ok) {
+        availableModels = [];
+        return;
+      }
+      const data = await res.json();
+      availableModels = data.models ?? [];
+      if (data.warning) showToast(data.warning, 'error');
+    } catch {
+      availableModels = [];
+    }
+  }
+
+  function applyStoredModel(): void {
+    if (!currentProvider) {
+      selectedModel.set('');
+      return;
+    }
+    // Pick the active model from provider-scoped storage so a value cached
+    // for opencode (e.g. "anthropic/claude-sonnet-4-6") never leaks into a
+    // claude-code session and vice-versa. We never auto-pick
+    // availableModels[0]: opencode's `models` listing can include identifiers
+    // its runtime later rejects. "" sends no --model flag, so each provider
+    // uses its own default.
+    const stored = localStorage.getItem(modelStorageKey(currentProvider)) ?? '';
+    const valid = stored !== '' && availableModels.includes(stored);
+    selectedModel.set(valid ? stored : '');
+  }
+
+  onMount(async () => {
+    const status = await loadProviders();
+    await loadModels();
+    applyStoredModel();
+
+    if (!status) return;
+    // Show the picker on first load when nothing is pre-decided: no env var,
+    // no previous explicit choice, AND the active provider's CLI is missing.
+    // (If the CLI is present, the user can keep using the auto-picked default
+    // without being interrupted.)
+    const hasPicked = localStorage.getItem(PROVIDER_PICKED_KEY) === '1';
+    const activeAvailable = status.available[status.active] ?? false;
+    if (!status.from_env && !hasPicked && !activeAvailable) {
+      providerPickerOpen.set(true);
+    }
+    if (status.from_env && !activeAvailable) {
+      showToast(
+        `AI_PROVIDER=${status.active} but ${status.clis[status.active] ?? status.active} is not on PATH.`,
+        'error',
+      );
+    } else if (status.active) {
+      showToast(`AI provider: ${status.active}`, 'info');
     }
   });
 
-  function onModelChange(value: string) {
+  // When the provider changes (modal pick), refresh the model list and
+  // re-apply provider-scoped model storage.
+  $effect(() => {
+    const next = $aiProvider;
+    if (!next || next === currentProvider) return;
+    currentProvider = next;
+    localStorage.setItem(PROVIDER_PICKED_KEY, '1');
+    void (async () => {
+      await loadModels();
+      applyStoredModel();
+    })();
+  });
+
+  // The dropdown's reserved value used for "let me type a custom model id".
+  const CUSTOM_SENTINEL = '__custom__';
+
+  let customMode = $state(false);
+  let customDraft = $state('');
+  let customInput = $state<HTMLInputElement | null>(null);
+
+  function persistModel(value: string): void {
     selectedModel.set(value);
     if (currentProvider) {
       localStorage.setItem(modelStorageKey(currentProvider), value);
     }
   }
 
-  function goHome() {
+  function onModelChange(value: string): void {
+    if (value === CUSTOM_SENTINEL) {
+      // Switch the row into the free-form input. Keep the existing custom
+      // value (if any) as the draft so the user sees what they had.
+      customDraft = $selectedModel || '';
+      customMode = true;
+      // Focus the input on the next tick after Svelte has rendered it.
+      queueMicrotask(() => customInput?.focus());
+      return;
+    }
+    customMode = false;
+    persistModel(value);
+  }
+
+  function commitCustom(): void {
+    const trimmed = customDraft.trim();
+    customMode = false;
+    persistModel(trimmed);
+  }
+
+  function cancelCustom(): void {
+    customMode = false;
+    // Don't change selectedModel — the dropdown's `value` binding will
+    // re-sync against whatever was persisted.
+  }
+
+  // When the model is changed elsewhere (e.g. provider switch resets it to
+  // ""), make sure we exit custom mode so the dropdown doesn't get stuck.
+  $effect(() => {
+    const m = $selectedModel;
+    const isInList = availableModels.includes(m);
+    if (m === '' || isInList) customMode = false;
+  });
+
+  function goHome(): void {
     activeRepo.set(null);
     activePR.set(null);
   }
 
-  function goRepo() {
+  function goRepo(): void {
     activePR.set(null);
   }
+
+  function openPicker(): void {
+    providerPickerOpen.set(true);
+  }
+
+  let activeAvailable = $derived(
+    !!$providersStatus && ($providersStatus.available[$providersStatus.active] ?? false),
+  );
+  let providerLabel = $derived($aiProvider || 'no provider');
+
+  // Decide what the <select> should show. Three cases:
+  //   1. No model picked → "<provider> default" (value="")
+  //   2. Picked model is in availableModels → highlight it
+  //   3. Picked model is custom (non-empty, not in list) OR user just opened
+  //      the custom input → CUSTOM_SENTINEL highlights "Custom…"
+  let dropdownValue = $derived(
+    customMode || ($selectedModel !== '' && !availableModels.includes($selectedModel))
+      ? CUSTOM_SENTINEL
+      : $selectedModel,
+  );
 </script>
 
 <header class="topbar">
@@ -73,31 +193,59 @@
 
   <div class="spacer"></div>
 
-  {#if $aiProvider}
-    <span
-      class="provider-badge"
-      class:provider-claude={$aiProvider === 'claude-code'}
-      title="Active AI provider (set via AI_PROVIDER env var)"
-    >
-      {$aiProvider}
-    </span>
-  {/if}
+  <button
+    type="button"
+    class="provider-badge"
+    class:provider-claude={$aiProvider === 'claude-code'}
+    class:provider-missing={!activeAvailable && !!$aiProvider}
+    onclick={openPicker}
+    title={
+      !$aiProvider
+        ? 'Click to select an AI provider'
+        : activeAvailable
+        ? `Active AI provider: ${$aiProvider} (click to change)`
+        : `${$aiProvider} CLI is not installed (click to switch)`
+    }
+  >
+    {providerLabel}
+    {#if !activeAvailable && $aiProvider}<span class="dot-warn" aria-hidden="true">!</span>{/if}
+  </button>
 
-  {#if $aiProvider && availableModels.length > 0}
-    <div class="model-selector">
-      <span class="model-label">Model</span>
+  <div class="model-selector">
+    <span class="model-label">Model</span>
+    {#if customMode}
+      <input
+        bind:this={customInput}
+        bind:value={customDraft}
+        class="model-input"
+        type="text"
+        placeholder="model id, e.g. eu.anthropic.claude-sonnet-4-20250514-v1:0"
+        onblur={commitCustom}
+        onkeydown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commitCustom(); }
+          else if (e.key === 'Escape') { e.preventDefault(); cancelCustom(); }
+        }}
+      />
+    {:else}
       <select
         class="model-select"
-        value={$selectedModel}
+        value={dropdownValue}
         onchange={(e) => onModelChange((e.target as HTMLSelectElement).value)}
+        disabled={!$aiProvider}
+        title={$selectedModel || ($aiProvider ? `${$aiProvider} default` : 'no provider')}
       >
-        <option value="">{$aiProvider} default</option>
+        <option value="">{$aiProvider ? `${$aiProvider} default` : 'no provider'}</option>
         {#each availableModels as m}
           <option value={m}>{m}</option>
         {/each}
+        {#if $selectedModel !== '' && !availableModels.includes($selectedModel)}
+          <option value={CUSTOM_SENTINEL}>{$selectedModel} (custom)</option>
+        {:else}
+          <option value={CUSTOM_SENTINEL}>Custom…</option>
+        {/if}
       </select>
-    </div>
-  {/if}
+    {/if}
+  </div>
 </header>
 
 <style>
@@ -159,11 +307,45 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+  .provider-badge:hover {
+    background: rgba(255, 107, 53, 0.2);
+    border-color: rgba(255, 107, 53, 0.6);
   }
   .provider-badge.provider-claude {
     background: rgba(120, 80, 220, 0.14);
     border-color: rgba(150, 110, 240, 0.45);
     color: rgb(190, 160, 250);
+  }
+  .provider-badge.provider-claude:hover {
+    background: rgba(120, 80, 220, 0.22);
+    border-color: rgba(150, 110, 240, 0.7);
+  }
+  .provider-badge.provider-missing {
+    background: rgba(220, 80, 80, 0.14);
+    border-color: rgba(220, 80, 80, 0.45);
+    color: rgb(240, 130, 130);
+  }
+  .provider-badge.provider-missing:hover {
+    background: rgba(220, 80, 80, 0.22);
+    border-color: rgba(220, 80, 80, 0.7);
+  }
+  .dot-warn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: rgba(220, 80, 80, 0.45);
+    color: white;
+    font-size: 10px;
+    font-weight: 800;
   }
 
   .model-selector {
@@ -195,4 +377,18 @@
   }
   .model-select:hover { border-color: rgba(255,107,53,0.4); color: var(--text-primary); }
   .model-select:focus { outline: none; border-color: var(--accent); }
+  .model-input {
+    background: var(--glass-bg);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    width: 360px;
+    max-width: 50vw;
+    outline: none;
+  }
+  .model-input::placeholder { color: var(--text-muted); }
+  .model-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(255,107,53,0.15); }
 </style>

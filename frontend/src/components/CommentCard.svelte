@@ -167,7 +167,7 @@
 
   <div class="comment-actions">
     {#if fixStatus === 'idle'}
-      <button class="btn btn-accent btn-sm" onclick={runFix}>⚡ Fix & Submit PR</button>
+      <button class="btn btn-accent btn-sm" onclick={runFix}>⚡ Generate Fix</button>
     {:else if fixStatus === 'running'}
       <button class="btn btn-sm" disabled>Implementing fix…</button>
     {:else if fixStatus === 'done' && fixResult?.has_changes}

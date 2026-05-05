@@ -11,6 +11,13 @@
 
 **`gh-review-tool` is a self-hosted, open-source AI code reviewer for GitHub.** It wires the `gh` CLI to the AI provider of your choice and gives you a desktop-class dashboard for browsing pull requests, getting streaming AI analysis with P0–P3 severity ratings, publishing inline review comments or full *Request Changes* reviews, and implementing fixes directly on the PR branch — without ever uploading a diff to a third-party SaaS.
 
+> ⚠️ **Heads up — `claude-code` provider is gated behind a feature flag.**
+> The Claude Code adapter shipped recently and is not yet stable enough for
+> day-to-day use (model discovery quirks on Bedrock deployments, occasional
+> 4xx/5xx mishandling on the reviews endpoint). It is **disabled by default**.
+> Set `ENABLE_CLAUDE_CODE=1` to opt in. Full rationale in
+> [Claude Code is disabled by default](#claude-code-is-disabled-by-default).
+
 ### ✨ Highlights
 
 - ⚡ **Streaming AI code reviews** — Server-Sent Events render the analysis as the model produces it; no waiting for a giant blob to land at the end.
@@ -33,6 +40,7 @@
 - [Installation](#installation)
 - [Usage](#usage)
 - [Configuration](#configuration)
+- [Claude Code is disabled by default](#claude-code-is-disabled-by-default)
 - [Adapting for Your Needs](#adapting-for-your-needs)
 - [Updating](#updating)
 - [Troubleshooting](#troubleshooting)
@@ -81,7 +89,9 @@ If you want a hosted SaaS that auto-reviews every PR — this is not that. See [
 - **[GitHub CLI (`gh`)](https://cli.github.com/)** — authenticated via `gh auth login`
 - **An AI CLI provider** — at least one of:
   - **[opencode CLI](https://opencode.ai)** — default provider, supports OpenRouter / Anthropic / OpenAI / local models
-  - **[Claude Code CLI](https://docs.claude.com/claude-code)** — opt in with `AI_PROVIDER=claude-code`
+  - **[Claude Code CLI](https://docs.claude.com/claude-code)** — currently
+    disabled by default; opt in with `ENABLE_CLAUDE_CODE=1` (see
+    [Claude Code is disabled by default](#claude-code-is-disabled-by-default))
 
 > **Heads up:** authentication is handled entirely by the `gh` CLI keyring and the AI provider's own login flow. The tool itself never reads or stores tokens.
 
@@ -107,8 +117,8 @@ cd ..
 # Start the server (default provider: opencode)
 uv run uvicorn app.main:app --reload
 
-# …or start with Claude Code as the active AI provider
-AI_PROVIDER=claude-code uv run uvicorn app.main:app --reload
+# …or start with Claude Code as the active AI provider (requires opting in — see below)
+ENABLE_CLAUDE_CODE=1 AI_PROVIDER=claude-code uv run uvicorn app.main:app --reload
 ```
 
 Open **<http://localhost:8000>** in your browser. That's it — no config files, no signup, no API keys to paste.
@@ -118,19 +128,19 @@ Open **<http://localhost:8000>** in your browser. That's it — no config files,
 If you have `tmux` installed, `./launch.sh` boots backend + frontend dev server in a single split window:
 
 ```bash
-./launch.sh                          # default provider (opencode)
-./launch.sh --provider claude-code   # use Claude Code
-./launch.sh --help                   # full usage
+./launch.sh                                              # default provider (opencode)
+ENABLE_CLAUDE_CODE=1 ./launch.sh --provider claude-code  # use Claude Code (opt in)
+./launch.sh --help                                       # full usage
 ```
 
 ### Switching AI providers at runtime
 
 Pick the provider from the in-app picker, **or** set it at server startup via the `AI_PROVIDER` env var. No restart required when switching from the UI:
 
-| Value | CLI required on `PATH` |
-|------|----------------------|
-| `opencode` *(default)* | `opencode` |
-| `claude-code` | `claude` |
+| Value | CLI required on `PATH` | Default? |
+|------|----------------------|----------|
+| `opencode` | `opencode` | ✅ default |
+| `claude-code` | `claude` | ⚠️ disabled — set `ENABLE_CLAUDE_CODE=1` to opt in |
 
 Both providers implement the same `AIProvider` port (see `app/ports/ai_provider.py`) and are interchangeable for review, comment analysis, and fix flows. Models are listed dynamically per provider.
 
@@ -157,9 +167,10 @@ No environment variables are required. Authentication is handled entirely by the
 
 Optional environment variables:
 
-| Variable      | Default     | Purpose                                                |
-|---------------|-------------|--------------------------------------------------------|
-| `AI_PROVIDER` | `opencode`  | Selects the AI backend at startup. Supported: `opencode`, `claude-code`. Live-switchable from the UI. |
+| Variable              | Default     | Purpose                                                |
+|-----------------------|-------------|--------------------------------------------------------|
+| `AI_PROVIDER`         | `opencode`  | Selects the AI backend at startup. Supported: `opencode`, `claude-code` *(when enabled)*. Live-switchable from the UI. |
+| `ENABLE_CLAUDE_CODE`  | unset       | Set to `1` (or `true` / `yes` / `on`) to enable the `claude-code` provider — see [Claude Code is disabled by default](#claude-code-is-disabled-by-default) |
 
 Data is stored in:
 
@@ -167,6 +178,75 @@ Data is stored in:
 - `~/.gh-review-tool/` — bare git clones and worktrees used by the AI fix flow.
 
 See [`.env.example`](.env.example) for the full list of optional variables.
+
+---
+
+## Claude Code is disabled by default
+
+The `claude-code` provider ships in this repo but is **gated behind the
+`ENABLE_CLAUDE_CODE` feature flag** and excluded from the provider picker
+when the flag is unset. The opencode provider remains available without any
+flag.
+
+### Why is it off?
+
+The Claude Code adapter shipped recently and still has rough edges that we
+want to fix before recommending it for everyday use:
+
+- **Model discovery is approximate.** Claude Code does not expose a
+  `models` listing command, so the adapter only returns the three universal
+  aliases (`opus`, `sonnet`, `haiku`). On AWS Bedrock deployments the alias
+  layer maps to the correct backend-specific ID automatically — but if you
+  want to pin a specific version you currently have to type it manually
+  (e.g. `eu.anthropic.claude-sonnet-4-5-20250929-v1:0` for Bedrock EU).
+- **Bedrock inference profile errors are not always actionable.** When the
+  CLI reports `"may not exist or you may not have access"` for a model that
+  IS available on your account, it usually means the model ID format is
+  Anthropic-direct (`claude-sonnet-4-6`) rather than the Bedrock profile
+  format your account expects. The error surfaces but the fix is manual.
+- **Headless invocation requires `--bare`.** Without it the CLI's keychain
+  read fails inside subprocess invocations and falls back to a strict
+  model-validation path. The adapter passes `--bare` for read-only flows
+  (review, analyze, generate), but this is the kind of detail that's still
+  fragile across CLI versions.
+- **Reviews-API publishing has multiple fallbacks.** Posting a
+  `REQUEST_CHANGES` review can fail with `422` when an inline comment line
+  is outside the PR diff, or when the reviewer is the PR author. The
+  adapter handles those cases by folding comments into the body or
+  degrading to a regular PR comment, but the path is non-trivial.
+
+None of these are showstoppers for adventurous users — but they're enough
+that we don't want a freshly-cloned install pointing at claude-code by
+default.
+
+### How do I turn it back on?
+
+Restart the server with the flag set. Any of these values work
+(case-insensitive): `1`, `true`, `yes`, `on`.
+
+```bash
+# Pick the provider live from the UI after enabling the flag
+ENABLE_CLAUDE_CODE=1 uv run uvicorn app.main:app --reload
+
+# …or boot directly into claude-code as the active provider
+ENABLE_CLAUDE_CODE=1 AI_PROVIDER=claude-code uv run uvicorn app.main:app --reload
+
+# launch.sh helper inherits the env var
+ENABLE_CLAUDE_CODE=1 ./launch.sh --provider claude-code
+```
+
+When the flag is off and you try to switch to claude-code from the UI or
+via `POST /api/provider`, the server returns a `400` with a message
+explaining how to enable it. Setting `AI_PROVIDER=claude-code` while the
+flag is off logs a warning and falls back to auto-detect — the server
+still boots.
+
+### When will it become the default again?
+
+When the issues above are fixed. Track progress in
+[CHANGELOG.md](CHANGELOG.md) under "Unreleased". If you hit a specific
+problem with the provider, please [open an
+issue](https://github.com/Angelaben/my-gh-app/issues) so we can prioritize.
 
 ---
 

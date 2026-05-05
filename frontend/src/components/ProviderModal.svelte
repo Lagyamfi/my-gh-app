@@ -55,14 +55,17 @@
     if (e.key === 'Escape') close();
   }
 
-  // The list to render. Falls back to the well-known set if the status hasn't
-  // loaded yet (so the modal still works on the very first paint).
+  // Falls back to the always-on opencode provider if the status hasn't loaded
+  // yet (so the modal still works on the very first paint). claude-code is
+  // intentionally NOT in the fallback because it's gated behind
+  // ENABLE_CLAUDE_CODE on the server — once the real status loads it will
+  // appear if and only if the flag is on.
   const FALLBACK: ProvidersStatus = {
     active: '',
     from_env: false,
-    supported: ['opencode', 'claude-code'],
-    available: { opencode: true, 'claude-code': true },
-    clis: { opencode: 'opencode', 'claude-code': 'claude' },
+    supported: ['opencode'],
+    available: { opencode: true },
+    clis: { opencode: 'opencode' },
   };
 
   let status = $derived<ProvidersStatus>($providersStatus ?? FALLBACK);

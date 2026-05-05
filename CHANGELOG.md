@@ -7,6 +7,18 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **`claude-code` provider is now gated behind `ENABLE_CLAUDE_CODE`** and is
+  no longer registered by default. The integration is still rough enough
+  (model discovery quirks, Bedrock inference profile errors, multi-stage
+  fallbacks on the reviews API) that we don't want a fresh install pointing
+  at it out of the box. Set `ENABLE_CLAUDE_CODE=1` (or `true` / `yes` /
+  `on`) to opt back in. Setting `AI_PROVIDER=claude-code` while the flag
+  is off logs a warning and falls back to auto-detect; trying to switch
+  to it from the UI returns a `400` with a message explaining how to
+  enable it. See the new "Claude Code is disabled by default" section in
+  the README for the full rationale.
+
 ### Added
 - **Runtime AI provider picker** — a modal lets the user switch between
   `opencode` and `claude-code` without restarting the server or setting an

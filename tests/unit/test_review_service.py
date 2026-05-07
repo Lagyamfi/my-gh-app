@@ -197,3 +197,34 @@ class TestStreamReviewSplit:
         cached = cache_port.save_review.call_args[0][2]
         assert isinstance(cached, Review)
         assert "Reviewed across" in cached.summary
+
+
+class TestReadIntEnv:
+    """The helper that parses REVIEW_DIFF_MAX_CHARS / REVIEW_MAX_CONCURRENCY."""
+
+    def test_returns_default_when_unset(self, monkeypatch):
+        from app.services.review_service import _read_int_env
+        monkeypatch.delenv("MY_TEST_VAR", raising=False)
+        assert _read_int_env("MY_TEST_VAR", 42) == 42
+
+    def test_returns_default_when_empty_string(self, monkeypatch):
+        from app.services.review_service import _read_int_env
+        monkeypatch.setenv("MY_TEST_VAR", "")
+        assert _read_int_env("MY_TEST_VAR", 42) == 42
+
+    def test_returns_default_when_not_an_int(self, monkeypatch):
+        from app.services.review_service import _read_int_env
+        monkeypatch.setenv("MY_TEST_VAR", "abc")
+        assert _read_int_env("MY_TEST_VAR", 42) == 42
+
+    def test_returns_default_when_zero_or_negative(self, monkeypatch):
+        from app.services.review_service import _read_int_env
+        monkeypatch.setenv("MY_TEST_VAR", "0")
+        assert _read_int_env("MY_TEST_VAR", 42) == 42
+        monkeypatch.setenv("MY_TEST_VAR", "-5")
+        assert _read_int_env("MY_TEST_VAR", 42) == 42
+
+    def test_returns_parsed_value_when_valid(self, monkeypatch):
+        from app.services.review_service import _read_int_env
+        monkeypatch.setenv("MY_TEST_VAR", "100")
+        assert _read_int_env("MY_TEST_VAR", 42) == 100

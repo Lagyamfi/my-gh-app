@@ -101,18 +101,22 @@ class ReviewService:
         async def run_one(chunk: Chunk) -> tuple[Chunk, Review | None, BaseException | None]:
             review: Review | None = None
             error: BaseException | None = None
-            async with sem:
-                try:
-                    async for ev in self._ai.stream_review(
-                        repo_full_name, pr_number, chunk.content, model=model
-                    ):
-                        if isinstance(ev, (ReviewChunkEvent, ReviewWarningEvent)):
-                            await queue.put(ev)
-                        elif isinstance(ev, ReviewResultEvent):
-                            review = ev.review
-                except Exception as exc:  # noqa: BLE001 — propagate as warning
-                    error = exc
-            await queue.put((sentinel, chunk, review, error))
+            try:
+                async with sem:
+                    try:
+                        async for ev in self._ai.stream_review(
+                            repo_full_name, pr_number, chunk.content, model=model
+                        ):
+                            if isinstance(ev, (ReviewChunkEvent, ReviewWarningEvent)):
+                                await queue.put(ev)
+                            elif isinstance(ev, ReviewResultEvent):
+                                review = ev.review
+                    except Exception as exc:  # noqa: BLE001 — propagate as warning
+                        error = exc
+            finally:
+                # ALWAYS push the sentinel so the consumer never deadlocks,
+                # even if this task is cancelled mid-stream.
+                await queue.put((sentinel, chunk, review, error))
             return chunk, review, error
 
         tasks = [asyncio.create_task(run_one(c)) for c in chunks]
@@ -141,10 +145,13 @@ class ReviewService:
         for chunk, review, error in results:
             if error is not None or review is None:
                 failed_count += 1
-                msg = (
-                    f"Chunk failed: files={chunk.files} "
-                    f"error={type(error).__name__ if error else 'no result'}: {error}"
-                )
+                if error is not None:
+                    msg = (
+                        f"Chunk failed: files={chunk.files} "
+                        f"error={type(error).__name__}: {error}"
+                    )
+                else:
+                    msg = f"Chunk failed: files={chunk.files} no result returned"
                 yield ReviewWarningEvent([msg])
                 logger.warning("review-service | chunk failed | %s", msg)
                 continue
@@ -160,6 +167,11 @@ class ReviewService:
             merged_summary += "\n\n" + "\n\n".join(f"- {s}" for s in sub_summaries)
 
         merged = Review(summary=merged_summary, findings=findings)
+        logger.info(
+            "review-service | split done | repo=%s pr=#%d chunks=%d succeeded=%d failed=%d findings=%d",
+            repo_full_name, pr_number, len(chunks),
+            len(chunks) - failed_count, failed_count, len(findings),
+        )
         self._cache.save_review(repo_full_name, pr_number, merged)
         yield ReviewResultEvent(review=merged)
 

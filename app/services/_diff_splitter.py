@@ -86,9 +86,7 @@ def pack_chunks(files: list[FileDiff], max_chars: int) -> list[Chunk]:
             )
             continue
         placed = False
-        # Iterate from most-recent chunk back so a tiny straggler lands with
-        # other small files rather than topping off a near-full big chunk.
-        for chunk in reversed(chunks):
+        for chunk in chunks:
             if chunk.truncated_files:
                 # Don't pile more files into a chunk that's already at max.
                 continue

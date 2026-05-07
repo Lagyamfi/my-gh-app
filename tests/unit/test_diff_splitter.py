@@ -84,15 +84,16 @@ class TestPackChunks:
         assert chunks[0].truncated_files == []
 
     def test_ffd_ordering_packs_efficiently(self):
-        # 25 KB + 8 KB + 3 KB with a 30 KB threshold should produce 2 chunks:
-        # the big one alone, then the two smaller ones together.
+        # 25 KB + 8 KB + 3 KB with a 30 KB threshold should produce 2 chunks.
+        # FFD: big alone first, then small fits with big (25+3=28 ≤ 30),
+        # mid stays solo since 25+8 > 30.
         big = _make_file("big.py", 25000)
         mid = _make_file("mid.py", 8000)
         small = _make_file("small.py", 3000)
         chunks = pack_chunks([small, big, mid], max_chars=30000)
         assert len(chunks) == 2
-        assert chunks[0].files == ["big.py"]
-        assert sorted(chunks[1].files) == ["mid.py", "small.py"]
+        assert chunks[0].files == ["big.py", "small.py"]
+        assert chunks[1].files == ["mid.py"]
         for c in chunks:
             assert len(c.content) <= 30000
 

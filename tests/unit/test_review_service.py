@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from app.domain.models import Finding, Review
-from app.ports.ai_provider import ReviewChunkEvent, ReviewResultEvent
+from app.ports.ai_provider import ReviewChunkEvent, ReviewResultEvent, ReviewWarningEvent
 from app.services.review_service import ReviewService
 
 
@@ -48,7 +48,7 @@ class TestGetOrRunReview:
         review = _make_review("fresh")
         result_event = ReviewResultEvent(review)
 
-        async def mock_stream(repo, pr, diff):
+        async def mock_stream(repo, pr, diff, model=None):
             yield ReviewChunkEvent("some text")
             yield result_event
 
@@ -63,7 +63,7 @@ class TestRerunReview:
         review = _make_review("new review")
         result_event = ReviewResultEvent(review)
 
-        async def mock_stream(repo, pr, diff):
+        async def mock_stream(repo, pr, diff, model=None):
             yield ReviewChunkEvent("text")
             yield result_event
 
@@ -96,3 +96,104 @@ class TestStreamReview:
     async def test_clear_cache_removes_review(self, service, cache_port):
         service.clear_cache("acme/backend", 1)
         cache_port.clear_review.assert_called_once_with("acme/backend", 1)
+
+
+class TestStreamReviewSplit:
+    async def test_diff_under_threshold_uses_single_call(
+        self, service, ai_provider, vcs_port, monkeypatch
+    ):
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "10000")
+        vcs_port.get_diff.return_value = "diff --git a/a.py b/a.py\n" + "x" * 100
+
+        review = Review(summary="small", findings=[])
+        call_count = 0
+
+        async def mock_stream(repo, pr, diff, model=None):
+            nonlocal call_count
+            call_count += 1
+            yield ReviewChunkEvent("chunk")
+            yield ReviewResultEvent(review)
+
+        ai_provider.stream_review = mock_stream
+        events = [e async for e in service.stream_review("acme/backend", 1)]
+
+        assert call_count == 1
+        warnings = [e for e in events if isinstance(e, ReviewWarningEvent)]
+        assert warnings == []
+        results = [e for e in events if isinstance(e, ReviewResultEvent)]
+        assert len(results) == 1
+        assert results[0].review.summary == "small"
+
+    async def test_diff_over_threshold_splits_and_merges(
+        self, service, ai_provider, vcs_port, monkeypatch
+    ):
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "200")
+        monkeypatch.setenv("REVIEW_MAX_CONCURRENCY", "5")
+
+        # Two files, each ~150 chars, totalling ~300 → must split into 2 chunks.
+        diff = (
+            "diff --git a/a.py b/a.py\n" + "a" * 130 + "\n"
+            "diff --git a/b.py b/b.py\n" + "b" * 130 + "\n"
+        )
+        vcs_port.get_diff.return_value = diff
+
+        call_diffs: list[str] = []
+
+        async def mock_stream(repo, pr, sub_diff, model=None):
+            call_diffs.append(sub_diff)
+            tag = "a" if "a.py" in sub_diff else "b"
+            yield ReviewChunkEvent(f"text-{tag}")
+            yield ReviewResultEvent(
+                Review(
+                    summary=f"summary-{tag}",
+                    findings=[Finding(priority="P1", title=f"finding-{tag}", description="d")],
+                )
+            )
+
+        ai_provider.stream_review = mock_stream
+        events = [e async for e in service.stream_review("acme/backend", 1)]
+
+        # Two parallel sub-reviews fired.
+        assert len(call_diffs) == 2
+
+        # Initial split warning emitted before any chunk text.
+        warnings = [e for e in events if isinstance(e, ReviewWarningEvent)]
+        assert len(warnings) >= 1
+        first_warning_text = " ".join(warnings[0].lines)
+        assert "split into 2 chunks" in first_warning_text
+        assert "2 files" in first_warning_text
+
+        # Both sub-streams' chunk events surfaced to the caller.
+        chunk_texts = [e.text for e in events if isinstance(e, ReviewChunkEvent)]
+        assert "text-a" in chunk_texts
+        assert "text-b" in chunk_texts
+
+        # Final merged review: both findings, structured summary.
+        results = [e for e in events if isinstance(e, ReviewResultEvent)]
+        assert len(results) == 1
+        merged = results[0].review
+        titles = sorted(f.title for f in merged.findings)
+        assert titles == ["finding-a", "finding-b"]
+        assert "Reviewed across 2 chunks" in merged.summary
+        assert "2 files" in merged.summary
+
+    async def test_split_path_caches_merged_review(
+        self, service, ai_provider, cache_port, vcs_port, monkeypatch
+    ):
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "100")
+        diff = (
+            "diff --git a/a.py b/a.py\n" + "a" * 80 + "\n"
+            "diff --git a/b.py b/b.py\n" + "b" * 80 + "\n"
+        )
+        vcs_port.get_diff.return_value = diff
+
+        async def mock_stream(repo, pr, sub_diff, model=None):
+            yield ReviewResultEvent(Review(summary="s", findings=[]))
+
+        ai_provider.stream_review = mock_stream
+        _ = [e async for e in service.stream_review("acme/backend", 1)]
+
+        cache_port.save_review.assert_called_once()
+        cached = cache_port.save_review.call_args[0][2]
+        assert isinstance(cached, Review)
+        assert "Reviewed across" in cached.summary

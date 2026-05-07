@@ -167,10 +167,12 @@ No environment variables are required. Authentication is handled entirely by the
 
 Optional environment variables:
 
-| Variable              | Default     | Purpose                                                |
-|-----------------------|-------------|--------------------------------------------------------|
-| `AI_PROVIDER`         | `opencode`  | Selects the AI backend at startup. Supported: `opencode`, `claude-code` *(when enabled)*. Live-switchable from the UI. |
-| `ENABLE_CLAUDE_CODE`  | unset       | Set to `1` (or `true` / `yes` / `on`) to enable the `claude-code` provider — see [Claude Code is disabled by default](#claude-code-is-disabled-by-default) |
+| Variable                  | Default     | Purpose                                                |
+|---------------------------|-------------|--------------------------------------------------------|
+| `AI_PROVIDER`             | `opencode`  | Selects the AI backend at startup. Supported: `opencode`, `claude-code` *(when enabled)*. Live-switchable from the UI. |
+| `ENABLE_CLAUDE_CODE`      | unset       | Set to `1` (or `true` / `yes` / `on`) to enable the `claude-code` provider — see [Claude Code is disabled by default](#claude-code-is-disabled-by-default) |
+| `REVIEW_DIFF_MAX_CHARS`   | `30000`     | Threshold above which the PR diff is split by file and reviewed in parallel sub-calls. Raise for large-context models. |
+| `REVIEW_MAX_CONCURRENCY`  | `3`         | Maximum number of parallel sub-reviews launched when a diff is split. Each spawns one provider subprocess. |
 
 Data is stored in:
 

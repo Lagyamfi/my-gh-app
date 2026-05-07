@@ -1,7 +1,5 @@
 """Tests for app.services._diff_splitter."""
-import pytest
-
-from app.services._diff_splitter import Chunk, FileDiff, pack_chunks, split_unified_diff
+from app.services._diff_splitter import FileDiff, pack_chunks, split_unified_diff
 
 
 SAMPLE_DIFF = """diff --git a/foo.py b/foo.py

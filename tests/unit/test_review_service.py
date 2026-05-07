@@ -250,8 +250,12 @@ class TestStreamReviewSplit:
         vcs_port.get_diff.return_value = diff
 
         async def mock_stream(repo, pr, sub_diff, model=None):
+            # The yield below is unreachable but required to make this an
+            # async generator (so it matches the AIProvider.stream_review
+            # signature). Always raises before yielding.
+            if False:
+                yield
             raise ProviderError("boom")
-            yield  # noqa: pragma: no cover — make this an async generator
 
         ai_provider.stream_review = mock_stream
         events = [e async for e in service.stream_review("acme/backend", 1)]

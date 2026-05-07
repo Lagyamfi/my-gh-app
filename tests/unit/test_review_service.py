@@ -271,6 +271,42 @@ class TestStreamReviewSplit:
         assert results[0].review.findings == []
         assert "2 failed" in results[0].review.summary
 
+    async def test_merged_findings_sorted_by_priority(
+        self, service, ai_provider, vcs_port, monkeypatch
+    ):
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "200")
+        monkeypatch.setenv("REVIEW_MAX_CONCURRENCY", "5")
+
+        diff = (
+            "diff --git a/a.py b/a.py\n" + "a" * 130 + "\n"
+            "diff --git a/b.py b/b.py\n" + "b" * 130 + "\n"
+        )
+        vcs_port.get_diff.return_value = diff
+
+        async def mock_stream(repo, pr, sub_diff, model=None):
+            if "a.py" in sub_diff:
+                yield ReviewResultEvent(
+                    Review(summary="a", findings=[
+                        Finding(priority="P2", title="low-a", description="d"),
+                        Finding(priority="P0", title="critical-a", description="d"),
+                    ])
+                )
+            else:
+                yield ReviewResultEvent(
+                    Review(summary="b", findings=[
+                        Finding(priority="P3", title="info-b", description="d"),
+                        Finding(priority="P1", title="medium-b", description="d"),
+                    ])
+                )
+
+        ai_provider.stream_review = mock_stream
+        events = [e async for e in service.stream_review("acme/backend", 1)]
+
+        results = [e for e in events if isinstance(e, ReviewResultEvent)]
+        assert len(results) == 1
+        priorities = [f.priority for f in results[0].review.findings]
+        assert priorities == ["P0", "P1", "P2", "P3"]
+
     async def test_concurrency_cap_is_respected(
         self, service, ai_provider, vcs_port, monkeypatch
     ):

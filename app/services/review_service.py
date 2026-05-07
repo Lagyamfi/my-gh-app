@@ -166,6 +166,9 @@ class ReviewService:
         if sub_summaries:
             merged_summary += "\n\n" + "\n\n".join(f"- {s}" for s in sub_summaries)
 
+        # Sort findings by priority so P0 appears first, then P1, P2, P3.
+        findings.sort(key=lambda f: f.priority)
+
         merged = Review(summary=merged_summary, findings=findings)
         logger.info(
             "review-service | split done | repo=%s pr=#%d chunks=%d succeeded=%d failed=%d findings=%d",

@@ -198,6 +198,73 @@ class TestStreamReviewSplit:
         assert isinstance(cached, Review)
         assert "Reviewed across" in cached.summary
 
+    async def test_one_chunk_failure_emits_warning_and_preserves_others(
+        self, service, ai_provider, vcs_port, monkeypatch
+    ):
+        from app.domain.exceptions import ProviderError
+
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "100")
+        diff = (
+            "diff --git a/a.py b/a.py\n" + "a" * 80 + "\n"
+            "diff --git a/b.py b/b.py\n" + "b" * 80 + "\n"
+        )
+        vcs_port.get_diff.return_value = diff
+
+        async def mock_stream(repo, pr, sub_diff, model=None):
+            if "a.py" in sub_diff:
+                raise ProviderError("claude exited with code 124")
+            yield ReviewResultEvent(
+                Review(
+                    summary="b ok",
+                    findings=[Finding(priority="P2", title="from-b", description="d")],
+                )
+            )
+
+        ai_provider.stream_review = mock_stream
+        events = [e async for e in service.stream_review("acme/backend", 1)]
+
+        warnings = [e for e in events if isinstance(e, ReviewWarningEvent)]
+        flat = " ".join(line for w in warnings for line in w.lines)
+        assert "Chunk failed" in flat
+        assert "a.py" in flat
+        assert "ProviderError" in flat
+
+        results = [e for e in events if isinstance(e, ReviewResultEvent)]
+        assert len(results) == 1
+        merged = results[0].review
+        assert [f.title for f in merged.findings] == ["from-b"]
+        assert "1 failed" in merged.summary
+
+    async def test_all_chunks_fail_yields_empty_review_with_warnings(
+        self, service, ai_provider, vcs_port, monkeypatch
+    ):
+        from app.domain.exceptions import ProviderError
+
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "100")
+        diff = (
+            "diff --git a/a.py b/a.py\n" + "a" * 80 + "\n"
+            "diff --git a/b.py b/b.py\n" + "b" * 80 + "\n"
+        )
+        vcs_port.get_diff.return_value = diff
+
+        async def mock_stream(repo, pr, sub_diff, model=None):
+            raise ProviderError("boom")
+            yield  # noqa: pragma: no cover — make this an async generator
+
+        ai_provider.stream_review = mock_stream
+        events = [e async for e in service.stream_review("acme/backend", 1)]
+
+        warnings = [e for e in events if isinstance(e, ReviewWarningEvent)]
+        chunk_failure_warnings = [
+            w for w in warnings if any("Chunk failed" in line for line in w.lines)
+        ]
+        assert len(chunk_failure_warnings) == 2
+
+        results = [e for e in events if isinstance(e, ReviewResultEvent)]
+        assert len(results) == 1
+        assert results[0].review.findings == []
+        assert "2 failed" in results[0].review.summary
+
 
 class TestReadIntEnv:
     """The helper that parses REVIEW_DIFF_MAX_CHARS / REVIEW_MAX_CONCURRENCY."""

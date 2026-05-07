@@ -1,4 +1,6 @@
 """Tests for ReviewService."""
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -264,6 +266,44 @@ class TestStreamReviewSplit:
         assert len(results) == 1
         assert results[0].review.findings == []
         assert "2 failed" in results[0].review.summary
+
+    async def test_concurrency_cap_is_respected(
+        self, service, ai_provider, vcs_port, monkeypatch
+    ):
+        monkeypatch.setenv("REVIEW_DIFF_MAX_CHARS", "100")
+        monkeypatch.setenv("REVIEW_MAX_CONCURRENCY", "2")
+
+        # 5 files, each ~80 chars → 5 chunks (each file is its own chunk
+        # because two ~80-char files would exceed the 100-char threshold).
+        diff = "".join(
+            f"diff --git a/f{i}.py b/f{i}.py\n" + "x" * 80 + "\n"
+            for i in range(5)
+        )
+        vcs_port.get_diff.return_value = diff
+
+        in_flight = 0
+        max_in_flight = 0
+        lock = asyncio.Lock()
+
+        async def mock_stream(repo, pr, sub_diff, model=None):
+            nonlocal in_flight, max_in_flight
+            async with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            try:
+                # Hold the call long enough for parallel scheduling to settle.
+                await asyncio.sleep(0.01)
+                yield ReviewResultEvent(Review(summary="ok", findings=[]))
+            finally:
+                async with lock:
+                    in_flight -= 1
+
+        ai_provider.stream_review = mock_stream
+        _ = [e async for e in service.stream_review("acme/backend", 1)]
+
+        assert max_in_flight <= 2, f"semaphore breached: max_in_flight={max_in_flight}"
+        # Sanity: we did actually overlap (otherwise the cap test is vacuous).
+        assert max_in_flight >= 2
 
 
 class TestReadIntEnv:

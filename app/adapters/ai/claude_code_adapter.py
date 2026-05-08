@@ -256,7 +256,7 @@ class ClaudeCodeAdapter(AIProvider):
         )
         chunks: list[str] = []
         warning_lines: list[str] = []
-        async for chunk in _stream_claude_code(message, context=diff[:30000], model=model):
+        async for chunk in _stream_claude_code(message, context=diff, model=model):
             if chunk.startswith("\x00STDERR\x00"):
                 warning_lines.append(chunk[8:])
             else:

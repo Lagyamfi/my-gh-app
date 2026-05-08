@@ -4,7 +4,7 @@
     stagedReviewFindings,
     publishReviewsModalOpen,
   } from '../stores/prs';
-  import type { Repo, PR } from '../lib/types';
+  import type { Repo, PR, Finding } from '../lib/types';
   import StreamingReview from './StreamingReview.svelte';
   import FindingCard from './FindingCard.svelte';
   import PublishReviewsModal from './PublishReviewsModal.svelte';
@@ -12,9 +12,48 @@
   let { repo, pr }: { repo: Repo; pr: PR } = $props();
 
   type ViewMode = 'idle' | 'streaming' | 'results';
+  type Priority = 'P0' | 'P1' | 'P2' | 'P3';
+
+  const ALL_PRIORITIES: Priority[] = ['P0', 'P1', 'P2', 'P3'];
 
   let mode = $state<ViewMode>('idle');
   let rerun = $state(false);
+  let activePriorities = $state<Set<Priority>>(new Set(ALL_PRIORITIES));
+
+  function togglePriority(p: Priority) {
+    const next = new Set(activePriorities);
+    if (next.has(p)) {
+      // Don't allow deselecting everything — keep at least one.
+      if (next.size > 1) next.delete(p);
+    } else {
+      next.add(p);
+    }
+    activePriorities = next;
+  }
+
+  function selectOnly(p: Priority) {
+    activePriorities = new Set([p]);
+  }
+
+  function selectAll() {
+    activePriorities = new Set(ALL_PRIORITIES);
+  }
+
+  let filteredFindings = $derived(
+    ($cachedReview?.findings ?? []).filter((f: Finding) =>
+      activePriorities.has(f.priority as Priority)
+    )
+  );
+
+  let priorityCounts = $derived(() => {
+    const counts: Record<Priority, number> = { P0: 0, P1: 0, P2: 0, P3: 0 };
+    for (const f of $cachedReview?.findings ?? []) {
+      if (f.priority in counts) counts[f.priority as Priority]++;
+    }
+    return counts;
+  });
+
+  let allSelected = $derived(activePriorities.size === ALL_PRIORITIES.length);
 
   // Transition idle → results when a cached review is already present on mount.
   $effect(() => {
@@ -27,6 +66,7 @@
     rerun = isRerun;
     mode = 'streaming';
     cachedReview.set(null);
+    activePriorities = new Set(ALL_PRIORITIES);
   }
 
   function handleReviewComplete() {
@@ -49,10 +89,34 @@
   {#if mode === 'streaming'}
     <StreamingReview {repo} {pr} {rerun} oncomplete={handleReviewComplete} />
   {:else if mode === 'results' && $cachedReview}
+    <div class="filter-bar">
+      <button
+        class="filter-btn filter-all"
+        class:active={allSelected}
+        onclick={selectAll}
+        title="Show all priorities"
+      >All <span class="filter-count">{$cachedReview.findings.length}</span></button>
+      {#each ALL_PRIORITIES as p (p)}
+        {@const count = priorityCounts()[p]}
+        <button
+          class="filter-btn filter-{p.toLowerCase()}"
+          class:active={activePriorities.has(p)}
+          onclick={(e) => e.shiftKey ? selectOnly(p) : togglePriority(p)}
+          title="{p} — Click to toggle, Shift+click to show only {p}"
+          disabled={count === 0}
+        >
+          {p} <span class="filter-count">{count}</span>
+        </button>
+      {/each}
+    </div>
+
     <div class="findings-list">
-      {#each $cachedReview.findings as finding, i (i)}
+      {#each filteredFindings as finding, i (i)}
         <FindingCard {finding} {repo} {pr} index={i} />
       {/each}
+      {#if filteredFindings.length === 0}
+        <div class="no-findings">No findings match the selected filters.</div>
+      {/if}
     </div>
 
     <div class="batch-publish">
@@ -84,6 +148,70 @@
   .cache-note { font-size: 10px; color: var(--text-muted); }
   .findings-list { display: flex; flex-direction: column; gap: 0; }
   .idle-state { padding: 40px 0; text-align: center; color: var(--text-muted); font-size: 12px; }
+  .no-findings { padding: 24px 0; text-align: center; color: var(--text-muted); font-size: 12px; }
+
+  /* Priority filter bar */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .filter-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 14px;
+    border: 1px solid var(--glass-border);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    user-select: none;
+  }
+  .filter-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+  .filter-btn:hover:not(:disabled) {
+    border-color: var(--text-secondary);
+    color: var(--text-secondary);
+  }
+  .filter-count {
+    font-size: 10px;
+    font-weight: 700;
+    opacity: 0.7;
+  }
+
+  /* Active state per priority */
+  .filter-all.active {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: var(--text-secondary);
+    color: var(--text-primary);
+  }
+  .filter-p0.active {
+    background: rgba(255, 59, 59, 0.15);
+    border-color: rgba(255, 59, 59, 0.5);
+    color: var(--p0);
+  }
+  .filter-p1.active {
+    background: rgba(255, 140, 66, 0.15);
+    border-color: rgba(255, 140, 66, 0.5);
+    color: var(--p1);
+  }
+  .filter-p2.active {
+    background: rgba(255, 209, 102, 0.12);
+    border-color: rgba(255, 209, 102, 0.4);
+    color: var(--p2);
+  }
+  .filter-p3.active {
+    background: rgba(126, 200, 227, 0.12);
+    border-color: rgba(126, 200, 227, 0.4);
+    color: var(--p3);
+  }
   .batch-publish {
     display: flex;
     align-items: center;

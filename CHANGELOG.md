@@ -7,6 +7,48 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Hexagonal AI-adapter base class.** A new `BaseCLIAIAdapter`
+  (`app/adapters/ai/_base.py`) consolidates the subprocess / streaming /
+  parsing plumbing that used to be duplicated across `OpenCodeAdapter` and
+  `ClaudeCodeAdapter`. Adding a new CLI-backed provider is now ~50 lines
+  (one `build_invocation` method plus optional hooks) instead of
+  ~250 lines of copy-paste, and any improvement to the streaming loop
+  benefits both adapters at once.
+- **Robust subprocess cleanup.** When the consumer disconnects mid-stream
+  (SSE client closed, request cancelled), the adapter now reaps the
+  subprocess, cancels the stderr reader, and releases the stdin pipe with
+  bounded waits — no more lingering `claude` / `opencode` processes per
+  abandoned request.
+- **Concurrent stdin draining.** Large opencode prompts (>64 KB) used to
+  risk deadlocking on the kernel pipe buffer because the synchronous
+  `write()` ran before the read loop started consuming stdout. The new
+  `_drain_stdin` helper writes in a concurrent task and `await drain()`s,
+  with broken-pipe tolerance.
+
+### Fixed
+- **Claude Code model-name passing** — the historical big blocker for the
+  connector. `normalize_model_name()` now handles every shape the picker
+  emits: opencode-style `provider/model` prefixes are stripped
+  (`anthropic/claude-sonnet-4-6` → `claude-sonnet-4-6`), universal aliases
+  (`opus`, `sonnet`, `haiku`), versioned IDs (`claude-opus-4-7`), and AWS
+  Bedrock inference profiles
+  (`eu.anthropic.claude-sonnet-4-5-20250929-v1:0`) all reach the CLI in the
+  exact form it expects. Blank / whitespace-only input is treated as "use
+  the default" instead of being forwarded as `--model ''` and rejected by
+  the CLI's strict validation path.
+- **Actionable failure hints from Claude Code.** When the CLI rejects a
+  model and replies *"Try `--model` to switch to X"*, the suggested ID is
+  now surfaced as a structured `[hint]` warning the UI can promote to a
+  one-click switch. When the CLI says the model is unavailable without
+  suggesting an alternative, a separate hint nudges the user toward the
+  Bedrock inference-profile format / universal aliases — but only when the
+  failure phrasing is anchored to a model identifier, so unrelated
+  "configuration file may not exist" errors don't get a misleading tip.
+- `generate_text` no longer silently drops stderr lines from the underlying
+  CLI; they're logged at WARNING level so commit-message / PR-description
+  failures stay debuggable.
+
 ### Changed
 - **`claude-code` provider is now gated behind `ENABLE_CLAUDE_CODE`** and is
   no longer registered by default. The integration is still rough enough

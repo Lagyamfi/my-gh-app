@@ -1,329 +1,299 @@
 """Claude Code CLI implementation of AIProvider.
 
-Mirrors the shape of OpenCodeAdapter but shells out to the `claude` CLI
-(Claude Code) instead of `opencode`. Selectable at startup via the
-AI_PROVIDER environment variable (see app.main).
+Mirrors the shape of :class:`OpenCodeAdapter` but shells out to the ``claude``
+(Claude Code) binary. Selectable at startup via the ``AI_PROVIDER`` env var,
+gated behind ``ENABLE_CLAUDE_CODE`` while we stabilise the integration.
+
+Most of the body lives in :class:`BaseCLIAIAdapter`; this module only adds
+the Claude-Code-specific behaviours that historically blocked everyday use:
+
+1. **Model-name normalisation.** Opencode's UI passes ``provider/model``
+   identifiers (``anthropic/claude-sonnet-4-6``); the Claude CLI rejects
+   those because the prefix isn't a valid backend marker. We strip the
+   prefix here so the *same* model picker works across both providers.
+2. **Bedrock model-suggestion surfacing.** When the CLI rejects a
+   ``claude-…`` ID and replies "Try ``--model`` to switch to <Bedrock
+   profile>", we forward the suggestion as a structured warning the UI
+   can promote to a one-click "switch model" tip.
+3. **Strict failure handling.** Unlike opencode, a non-zero exit means the
+   review failed — we raise so the SSE pipeline emits a top-level error
+   event instead of presenting a hollow "0 findings" review to the user.
+4. **Read-only flow uses ``--bare``.** Without it, headless subprocess
+   invocations fail the keychain-read step and fall back to a strict
+   model-validation path that rejects perfectly valid Bedrock IDs.
+5. **Fix flow uses ``--dangerously-skip-permissions``** but keeps the rest
+   of the project context (CLAUDE.md, hooks, plugins) intact.
 """
-import asyncio
-import json
+from __future__ import annotations
+
+import asyncio  # noqa: F401 — exposed as `claude_code_adapter.asyncio` for tests that monkeypatch `create_subprocess_exec` on this module's namespace.
 import logging
 import re
-import time
 from collections.abc import AsyncGenerator
 
-from app.adapters._subprocess import clean_env
-from app.domain.exceptions import ProviderError
-from app.domain.models import Comment, Finding, Review
-from app.ports.ai_provider import (
-    AIProvider,
-    FixChunkEvent,
-    ReviewChunkEvent,
-    ReviewResultEvent,
-    ReviewStreamEvent,
-    ReviewWarningEvent,
+from app.adapters.ai._base import (
+    BaseCLIAIAdapter,
+    CLIInvocation,
+    DEFAULT_FIX_TIMEOUT,
+    DEFAULT_GENERATE_TIMEOUT,
+    DEFAULT_REVIEW_TIMEOUT,
+    Mode,
+    StderrCategory,
 )
+from app.adapters.ai._parsing import parse_review_output as _parse_review_output_impl
 
 logger = logging.getLogger(__name__)
 
-_REVIEW_PROMPT_TEMPLATE = """You are reviewing Pull Request #{pr_number} from repository {repo_full_name}.
-Analyze the attached diff and provide a code review. For each issue found, classify it with a criticality level:
-- P0: Critical - Security vulnerability, data loss, crash
-- P1: Major - Bug, incorrect logic, performance issue
-- P2: Minor - Code style, naming, minor improvement
-- P3: Suggestion - Nice-to-have, optional improvement
-
-Return your response as a JSON object with this exact structure:
-{{"summary": "Brief overall assessment", "findings": [{{"criticality": "P0", "title": "Short title", "description": "Detailed explanation", "file": "filename if applicable", "line": "line number or range if applicable", "suggestion": "Suggested fix if applicable"}}]}}
-
-IMPORTANT: Return ONLY the JSON object, no markdown fences, no extra text."""
-
-_FIX_PROMPT_TEMPLATE = """You are fixing a code review comment on PR #{pr_number} in {repo_full_name}.
-The reviewer left this comment:
-
-{comment_body}
-
-You are currently in the repository checkout on the PR branch.
-Read the relevant files, understand the issue, and EDIT the files to implement the fix.
-Make minimal, targeted changes. Do NOT create new files unless absolutely necessary.
-Do NOT run tests or build commands — just make the code changes."""
-
-# Parses Claude Code's "Try --model to switch to <id>" suggestion from error output.
+# Parses Claude Code's "Try --model to switch to <id>" suggestion in error
+# output. Captures the raw model identifier (alphanumerics, underscores,
+# colons, dots, dashes, slashes) so the UI can offer a one-click switch.
 _SUGGESTION_RE = re.compile(r"--model to switch to ([\w.:/-]+)")
 
 
 def list_models() -> list[str]:
     """Return the model names accepted by the installed claude CLI.
 
-    Returns the three universal aliases — opus, sonnet, haiku — which Claude
-    Code maps to the appropriate backend-specific model ID automatically,
-    regardless of whether the backend is the Anthropic API, AWS Bedrock
-    (any region), Vertex AI, etc.
+    Returns the three universal aliases — ``opus``, ``sonnet``, ``haiku`` —
+    which Claude Code maps to the appropriate backend-specific model ID
+    automatically, regardless of whether the backend is the Anthropic API,
+    AWS Bedrock (any region), Vertex AI, etc.
 
-    Versioned IDs such as "claude-sonnet-4-6" are NOT returned because they
+    Versioned IDs such as ``claude-sonnet-4-6`` are NOT returned because they
     are Anthropic-API-specific and break on Bedrock/Vertex deployments where
     the equivalent ID has a different format (e.g. the Bedrock EU inference
-    profile "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"). Users who need
-    a specific pinned ID can enter it via the UI's free-form custom input.
+    profile ``eu.anthropic.claude-sonnet-4-5-20250929-v1:0``). Users who
+    need a specific pinned ID can enter it via the UI's free-form custom
+    input, which round-trips through :func:`normalize_model_name`.
     """
     return ["opus", "sonnet", "haiku"]
 
 
 def parse_model_suggestion(text: str) -> str | None:
-    """Extract a model ID from a Claude Code 'Try --model to switch to X' hint."""
-    m = _SUGGESTION_RE.search(text)
-    return m.group(1).rstrip(".") if m else None
+    """Extract a model ID from a Claude Code "Try --model to switch to X" hint.
+
+    Trailing punctuation (period, comma, semicolon) is stripped so the result
+    is safe to round-trip back into a ``--model`` argument.
+    """
+    match = _SUGGESTION_RE.search(text)
+    if not match:
+        return None
+    return match.group(1).rstrip(".,;")
 
 
-def _parse_review_output(output: str) -> Review:
-    """Parse raw AI output into a Review. Returns a fallback Review on parse failure."""
-    try:
-        start = output.find("{")
-        end = output.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(output[start:end])
-            findings = [
-                Finding(
-                    priority=f.get("priority", f.get("criticality", "P3")),
-                    title=f.get("title", ""),
-                    description=f.get("description", ""),
-                    file=f.get("file"),
-                    line=int(f["line"]) if f.get("line") is not None and str(f["line"]).isdigit() else None,
-                    suggestion=f.get("suggestion"),
+def normalize_model_name(model: str | None) -> str | None:
+    """Translate a model identifier into the form the ``claude`` CLI expects.
+
+    Resolves the single biggest source of "model not found" errors users have
+    hit with the Claude Code adapter:
+
+    - ``None`` / empty / whitespace-only → ``None`` (default model).
+    - ``"anthropic/claude-sonnet-4-6"`` → ``"claude-sonnet-4-6"`` (opencode
+      registry-style prefix stripped — the CLI rejects unknown prefixes).
+    - ``"opus"`` / ``"sonnet"`` / ``"haiku"`` → unchanged universal alias.
+    - ``"claude-opus-4-7"`` → unchanged versioned Anthropic-API ID.
+    - ``"eu.anthropic.claude-sonnet-4-5-20250929-v1:0"`` → unchanged Bedrock
+      inference profile (no prefix to strip — there's no slash).
+    - ``"  sonnet  "`` → ``"sonnet"`` (whitespace trimmed; otherwise the
+      CLI's strict equality check fails).
+    """
+    if model is None:
+        return None
+    cleaned = model.strip()
+    if not cleaned:
+        return None
+    # Opencode-style "<registry>/<model>" — strip only the *first* slash, so
+    # Bedrock IDs that legitimately contain slashes (none today, but the
+    # format reserves them) survive intact.
+    if "/" in cleaned:
+        cleaned = cleaned.split("/", 1)[1].strip()
+        if not cleaned:
+            return None
+    return cleaned
+
+
+# Phrases anchored to a model identifier (Claude/Bedrock-style) to avoid
+# false positives on unrelated "file may not exist" / "may not have access"
+# errors. Each pattern requires either a leading 'model' keyword or a
+# trailing model-identifier-shaped token before/after the phrase.
+_PHRASE_GROUP = r"(?:may not exist|may not have access|do not have access)"
+_ID_TOKEN = r"(?:claude-|anthropic\.|\beu\.|\bus\.|\bap\.)[\w.:-]+"
+_BEDROCK_HINT_PATTERNS = (
+    re.compile(rf"model\b[^.\n]{{0,80}}\b{_PHRASE_GROUP}", re.IGNORECASE),
+    re.compile(rf"{_PHRASE_GROUP}[^.\n]{{0,40}}\bmodel\b", re.IGNORECASE),
+    # Anthropic / Bedrock identifier tokens before the phrase.
+    re.compile(rf"{_ID_TOKEN}[^.\n]{{0,80}}{_PHRASE_GROUP}", re.IGNORECASE),
+    # Mirror: identifier tokens after the phrase.
+    re.compile(rf"{_PHRASE_GROUP}[^.\n]{{0,80}}{_ID_TOKEN}", re.IGNORECASE),
+)
+
+
+def _matches_bedrock_hint_phrase(text: str) -> bool:
+    return any(p.search(text) for p in _BEDROCK_HINT_PATTERNS)
+
+
+class ClaudeCodeAdapter(BaseCLIAIAdapter):
+    """Implements :class:`AIProvider` using the ``claude`` (Claude Code) CLI."""
+
+    cli_name = "claude-code"
+    cli_executable = "claude"
+    raise_on_nonzero_exit = True
+
+    def normalize_model(self, model: str | None) -> str | None:
+        return normalize_model_name(model)
+
+    def build_invocation(
+        self,
+        prompt: str,
+        *,
+        mode: Mode,
+        cwd: str | None,
+        model: str | None,
+    ) -> CLIInvocation:
+        # `-p --output-format text` = non-interactive print mode that exits
+        # cleanly when stdout drains.
+        argv: list[str] = ["claude", "-p", "--output-format", "text"]
+        if model:
+            argv += ["--model", model]
+        if mode == "fix":
+            # Fix flow needs CLAUDE.md auto-discovery, hooks and plugins for
+            # project context. Bypass the per-tool prompts so the run isn't
+            # blocked waiting for stdin confirmation.
+            argv.append("--dangerously-skip-permissions")
+        else:
+            # Read-only flows: --bare bypasses the keychain-read step that
+            # fails inside subprocess invocations. Without it, the CLI falls
+            # back to a strict model-validation path that rejects valid
+            # Bedrock IDs.
+            argv.append("--bare")
+        # Always positional. Linux ARG_MAX is ~2 MB so even large reviews fit;
+        # `-p` mode does not reliably consume stdin across CLI versions.
+        argv.append(prompt)
+        return CLIInvocation(argv=argv, cwd=cwd)
+
+    def classify_stderr(self, line: str) -> StderrCategory:
+        # Claude Code's stderr is sparse and almost always genuine warnings.
+        return "warning"
+
+    def extra_failure_warnings(
+        self,
+        *,
+        rc: int,
+        stdout_lines: list[str],
+        stderr_lines: list[str],
+    ) -> list[str]:
+        warnings: list[str] = []
+        all_lines = [*stdout_lines, *stderr_lines]
+        suggestion: str | None = None
+        for line in all_lines:
+            suggestion = parse_model_suggestion(line)
+            if suggestion:
+                break
+        if suggestion is not None:
+            warnings.append(
+                f"[hint] Claude Code suggested model {suggestion!r}. "
+                f"Set it from the model picker (free-form custom input) "
+                f"or via AI_PROVIDER's UI."
+            )
+        else:
+            joined = " ".join(all_lines)
+            if _matches_bedrock_hint_phrase(joined):
+                warnings.append(
+                    "[hint] Claude Code reports the model is unavailable. On "
+                    "Bedrock deployments this often means the ID format is "
+                    "Anthropic-direct (e.g. 'claude-sonnet-4-6') instead of "
+                    "the inference-profile format your account expects "
+                    "(e.g. 'eu.anthropic.claude-sonnet-4-5-20250929-v1:0'). "
+                    "Try the universal aliases: opus / sonnet / haiku."
                 )
-                for f in data.get("findings", [])
-            ]
-            review = Review(summary=data.get("summary", ""), findings=findings)
-            logger.info("claude-code | parsed review | findings=%d", len(findings))
-            return review
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("claude-code | parse failed | output_chars=%d error=%s", len(output), exc)
+        return warnings
 
-    logger.warning("claude-code | returning fallback review | output_chars=%d", len(output))
-    return Review(
-        summary="Review completed but output could not be parsed as structured JSON.",
-        findings=[],
-        raw_output=output,
-        raw_length=len(output),
-    )
+    async def _invoke_stream(
+        self,
+        message: str,
+        *,
+        mode: Mode,
+        context: str | None = None,
+        cwd: str | None = None,
+        model: str | None = None,
+        timeout: int = DEFAULT_REVIEW_TIMEOUT,
+    ) -> AsyncGenerator[str, None]:
+        # Route through the module-level helper so existing tests can patch
+        # `_stream_claude_code` with a fake stream. The real mode is forwarded
+        # so future hooks (logging, before_run, build_invocation) see the
+        # caller's intent rather than a flattened "fix"/"generate" reduction.
+        async for chunk in _stream_claude_code(
+            message,
+            context=context,
+            cwd=cwd,
+            model=model,
+            timeout=timeout,
+            allow_edits=(mode == "fix"),
+            mode=mode,
+        ):
+            yield chunk
+
+
+# Singleton shared by the module-level helper to avoid re-instantiating the
+# adapter on every invocation.
+_SHARED_ADAPTER: ClaudeCodeAdapter | None = None
+
+
+def _shared_adapter() -> ClaudeCodeAdapter:
+    global _SHARED_ADAPTER
+    if _SHARED_ADAPTER is None:
+        _SHARED_ADAPTER = ClaudeCodeAdapter()
+    return _SHARED_ADAPTER
 
 
 async def _stream_claude_code(
     message: str,
     context: str | None = None,
-    timeout: int = 300,
+    timeout: int = DEFAULT_REVIEW_TIMEOUT,
     cwd: str | None = None,
     model: str | None = None,
     allow_edits: bool = False,
+    *,
+    mode: Mode | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream raw claude (Claude Code) output line by line.
+    """Stream raw ``claude`` stdout and ``\\x00STDERR\\x00``-tagged stderr.
 
-    Uses `claude -p` (print/non-interactive mode) which prints to stdout and exits.
-    Always passes the prompt as a positional argument — claude's `-p` mode does not
-    reliably consume stdin in some installs. Linux ARG_MAX is ~2 MB so even large
-    review prompts fit comfortably.
+    Kept as a module-level helper because the existing test suite patches
+    this name to feed a fake stream into the adapter without spawning a
+    real subprocess.
+
+    ``allow_edits`` is the legacy boolean toggle (``True`` enables
+    ``--dangerously-skip-permissions`` for the fix flow). New callers should
+    pass ``mode`` explicitly so review/analyze/generate stay distinguishable
+    in logs and hooks; the boolean is honoured only when ``mode`` is omitted.
     """
-    prompt = message
-    if context:
-        prompt = f"{message}\n\n---\n\n{context}"
-
-    prompt_kb = len(prompt.encode()) / 1024
-    logger.info(
-        "claude-code | starting | cwd=%s prompt=%.1f KB model=%s edits=%s",
-        cwd or ".", prompt_kb, model or "default", allow_edits,
-    )
-    t_start = time.monotonic()
-
-    extra_args: list[str] = ["-p", "--output-format", "text"]
-    if model:
-        # Strip optional provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
-        cli_model = model.split("/", 1)[1] if "/" in model else model
-        extra_args += ["--model", cli_model]
-    if allow_edits:
-        # Fix flow: keep CLAUDE.md auto-discovery, hooks, plugins so claude
-        # has project context while editing, and bypass per-tool prompts.
-        extra_args += ["--dangerously-skip-permissions"]
-    else:
-        # Read-only flows (review, analyze comments, generate-text): use --bare
-        # so keychain reads, hooks, LSP, and CLAUDE.md auto-discovery are skipped.
-        # Without --bare, headless subprocess invocations fail the keychain-read
-        # step and fall back to a strict model-validation path.
-        extra_args += ["--bare"]
-
-    proc = await asyncio.create_subprocess_exec(
-        "claude", *extra_args, prompt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        env=clean_env(),
-    )
-
-    if proc.stdout is None or proc.stderr is None:
-        raise ProviderError("claude subprocess did not open stdout/stderr")
-
-    async def _read_stderr() -> list[str]:
-        lines = []
-        while True:
-            line = await proc.stderr.readline()  # type: ignore[union-attr]
-            if not line:
-                break
-            decoded = line.decode().rstrip()
-            if not decoded:
-                continue
-            logger.warning("claude-code | stderr | %s", decoded)
-            lines.append(decoded)
-        return lines
-
-    stderr_task = asyncio.create_task(_read_stderr())
-    output_lines = 0
-    stdout_capture: list[str] = []  # for surfacing as a warning when rc != 0
-
-    while True:
-        try:
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            elapsed = time.monotonic() - t_start
-            logger.error("claude-code | TIMEOUT after %.1fs | killing process", elapsed)
-            yield "\n[TIMEOUT]\n"
-            break
-        if not line:
-            break
-        decoded = line.decode()
-        output_lines += 1
-        stdout_capture.append(decoded)
-        logger.debug("claude-code | stdout | %s", decoded.rstrip())
-        yield decoded
-
-    await proc.wait()
-    elapsed = time.monotonic() - t_start
-    rc = proc.returncode
-    if rc == 0:
-        logger.info("claude-code | done | exit=%s lines=%d elapsed=%.1fs", rc, output_lines, elapsed)
-    else:
-        logger.warning("claude-code | done | exit=%s lines=%d elapsed=%.1fs", rc, output_lines, elapsed)
-
-    stderr_lines = await stderr_task
-
-    warning_lines = list(stderr_lines)
-    captured_stdout = "".join(stdout_capture).strip()
-    if rc != 0:
-        if output_lines == 0:
-            warning_lines.insert(0, f"[claude exited with code {rc} and produced no output]")
-        else:
-            warning_lines.insert(0, f"[claude exited with code {rc}]")
-            if captured_stdout:
-                warning_lines.append("[claude stdout]")
-                snippet = captured_stdout[:4000]
-                for cap_line in snippet.splitlines()[:40]:
-                    warning_lines.append(cap_line)
-
-    for err_line in warning_lines:
-        yield f"\x00STDERR\x00{err_line}"
-
-    # Fail loud: a non-zero exit means claude couldn't produce a usable
-    # response. Raise so the SSE pipeline emits an `error` event and the UI
-    # shows it prominently instead of presenting a hollow "0 findings" review.
-    if rc != 0:
-        first_stdout_line = next(
-            (line for line in captured_stdout.splitlines() if line.strip()), ""
+    if mode is None:
+        mode = "fix" if allow_edits else "generate"
+    elif allow_edits and mode != "fix":
+        # Defensive: callers should pick one or the other, but `mode` wins.
+        logger.warning(
+            "claude-code | _stream_claude_code received allow_edits=True with "
+            "mode=%r — honouring mode (consider passing only one).",
+            mode,
         )
-        first_stderr_line = next(
-            (line for line in stderr_lines if line.strip()), ""
-        )
-        detail = first_stdout_line or first_stderr_line or "(no output)"
-        if len(detail) > 200:
-            detail = detail[:197] + "..."
-        logger.error(
-            "claude-code | failed | exit=%s | first_line=%r",
-            rc, detail,
-        )
-        raise ProviderError(f"claude exited with code {rc}: {detail}")
+    async for chunk in _shared_adapter().stream_cli(
+        message, context=context, cwd=cwd, model=model, timeout=timeout, mode=mode,
+    ):
+        yield chunk
 
 
-class ClaudeCodeAdapter(AIProvider):
-    """Implements AIProvider using the `claude` (Claude Code) CLI tool."""
+def _parse_review_output(output: str):
+    """Back-compat alias for :func:`app.adapters.ai._parsing.parse_review_output`."""
+    return _parse_review_output_impl(output, provider="claude-code")
 
-    async def stream_review(
-        self, repo_full_name: str, pr_number: int, diff: str, model: str | None = None
-    ) -> AsyncGenerator[ReviewStreamEvent, None]:
-        diff_kb = len(diff.encode()) / 1024
-        logger.info(
-            "review | start | provider=claude-code repo=%s pr=#%d diff=%.1f KB model=%s",
-            repo_full_name, pr_number, diff_kb, model or "default",
-        )
-        message = _REVIEW_PROMPT_TEMPLATE.format(
-            pr_number=pr_number, repo_full_name=repo_full_name
-        )
-        chunks: list[str] = []
-        warning_lines: list[str] = []
-        async for chunk in _stream_claude_code(message, context=diff, model=model):
-            if chunk.startswith("\x00STDERR\x00"):
-                warning_lines.append(chunk[8:])
-            else:
-                chunks.append(chunk)
-                yield ReviewChunkEvent(text=chunk)
 
-        if warning_lines:
-            yield ReviewWarningEvent(lines=warning_lines)
-
-        full_output = "".join(chunks).strip()
-        review = _parse_review_output(full_output)
-        logger.info(
-            "review | complete | provider=claude-code repo=%s pr=#%d findings=%d",
-            repo_full_name, pr_number, len(review.findings),
-        )
-        yield ReviewResultEvent(review=review)
-
-    async def analyze_comments(
-        self, repo_full_name: str, pr_number: int, comments: list[Comment]
-    ) -> list[dict]:
-        if not comments:
-            return []
-
-        comments_text = "\n\n".join(
-            f"Comment by {c.author}:\n{c.body}" for c in comments
-        )
-        message = (
-            f"Analyze the comments from PR #{pr_number} in {repo_full_name} attached below.\n"
-            "For each comment, assess criticality (P0-P3), validity (true/false), interest (high/medium/low), "
-            "and provide a summary.\n"
-            'Return a JSON array: [{"author": "username", "criticality": "P0", "valid": true, '
-            '"interest": "high", "summary": "Brief analysis", "original_body": "first 100 chars"}]\n'
-            "IMPORTANT: Return ONLY the JSON array, no markdown fences, no extra text."
-        )
-
-        output_parts: list[str] = []
-        async for chunk in _stream_claude_code(message, context=comments_text[:20000]):
-            output_parts.append(chunk)
-        output = "".join(output_parts)
-
-        try:
-            start = output.find("[")
-            end = output.rfind("]") + 1
-            if start >= 0 and end > start:
-                return json.loads(output[start:end])
-        except json.JSONDecodeError:
-            pass
-        return []
-
-    async def stream_fix(
-        self, repo_dir: str, repo_full_name: str, pr_number: int, comment_body: str
-    ) -> AsyncGenerator[FixChunkEvent, None]:
-        prompt = _FIX_PROMPT_TEMPLATE.format(
-            pr_number=pr_number,
-            repo_full_name=repo_full_name,
-            comment_body=comment_body,
-        )
-        async for chunk in _stream_claude_code(
-            prompt, cwd=repo_dir, timeout=600, allow_edits=True
-        ):
-            yield FixChunkEvent(text=chunk)
-
-    async def generate_text(self, prompt: str, timeout: int = 60) -> str:
-        parts: list[str] = []
-        async for chunk in _stream_claude_code(prompt, timeout=timeout):
-            parts.append(chunk)
-        result = "".join(parts).strip().strip("`").strip()
-        if result and len(result) <= 500:
-            return result
-        raise ProviderError(f"generate_text returned unusable output (length={len(result)})")
+__all__ = [
+    "ClaudeCodeAdapter",
+    "DEFAULT_FIX_TIMEOUT",
+    "DEFAULT_GENERATE_TIMEOUT",
+    "DEFAULT_REVIEW_TIMEOUT",
+    "_parse_review_output",
+    "_stream_claude_code",
+    "list_models",
+    "normalize_model_name",
+    "parse_model_suggestion",
+]

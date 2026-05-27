@@ -118,7 +118,7 @@
           onclick={editing ? cancelEdit : startEdit}
           title={editing ? 'Cancel edit' : hasOverride ? 'Edit saved comment' : 'Edit comment before publishing'}
         >
-          {editing ? '✗' : hasOverride ? '✎ Edited' : '✎'}
+          {editing ? '✗ Cancel' : hasOverride ? '✎ Edited' : '✎ Edit comment'}
         </button>
       {/if}
       <button
